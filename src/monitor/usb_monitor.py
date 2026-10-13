@@ -188,7 +188,7 @@ def run_monitor(duration: float | None) -> int:
     try:
         output({"type": "monitor_starting", "clock": "monotonic",
                 "boot_id": decoder.boot_id, "backend": "bpftrace"})
-        process = subprocess.Popen(["bpftrace", "-q", "-kk", "-B", "line", str(SCRIPT)],
+        process = subprocess.Popen(["bpftrace", "-q", "-k", "-B", "line", str(SCRIPT)],
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                    encoding="utf-8", errors="replace", start_new_session=True)
         for name, stream in (("stdout", process.stdout), ("stderr", process.stderr)):

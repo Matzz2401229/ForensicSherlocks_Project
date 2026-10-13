@@ -11,6 +11,3 @@
 /.venv/
 __pycache__/
 *.py[cod]
-
-# Temporary files (sq)
-STEP3-TESTING.md
