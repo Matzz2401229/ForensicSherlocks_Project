@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "default_action": "block",
+  "allowlist": [
+    {
+      "name": "lab-flash-drive",
+      "vendor_id": "058f",
+      "product_id": "6387"
+    }
+  ]
+}
