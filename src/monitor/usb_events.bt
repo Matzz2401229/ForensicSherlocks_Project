@@ -1,0 +1,69 @@
+// PortWatchman monitor v1. Observation only: no policy or authorisation writes.
+// Internal protocol: PW1, kind, timestamp, setup-start, bus, address, port, result.
+// CLOCK_MONOTONIC is explicit so Python receipt timestamps use the same clock.
+
+kprobe:usb_new_device
+{
+    $dev = (struct usb_device *)arg0;
+    if ($dev != 0) {
+        @depth[tid] = @depth[tid] + 1;
+        $depth = @depth[tid];
+        @started[tid, $depth] = nsecs(monotonic);
+        @bus[tid, $depth] = $dev->bus->busnum;
+        @address[tid, $depth] = $dev->devnum;
+        @port[tid, $depth] = $dev->devpath;
+        printf("PW1\tsetup_started\t%llu\t%llu\t%d\t%d\t%s\t0\n",
+               @started[tid, $depth], @started[tid, $depth],
+               @bus[tid, $depth], @address[tid, $depth], @port[tid, $depth]);
+    }
+}
+
+kretprobe:usb_new_device
+/@depth[tid] > 0/
+{
+    $depth = @depth[tid];
+    printf("PW1\tsetup_result\t%llu\t%llu\t%d\t%d\t%s\t%d\n",
+           nsecs(monotonic), @started[tid, $depth],
+           @bus[tid, $depth], @address[tid, $depth], @port[tid, $depth],
+           (int32)retval);
+    delete(@started[tid, $depth]);
+    delete(@bus[tid, $depth]);
+    delete(@address[tid, $depth]);
+    delete(@port[tid, $depth]);
+    if ($depth == 1) {
+        delete(@depth[tid]);
+    } else {
+        @depth[tid] = $depth - 1;
+    }
+}
+
+// usb_disconnect receives usb_device **, unlike usb_new_device's usb_device *.
+// This event marks entry into disconnect handling, not completed teardown.
+kprobe:usb_disconnect
+{
+    if (arg0 != 0) {
+        $dev = *(struct usb_device **)arg0;
+        if ($dev != 0) {
+            printf("PW1\tdisconnect_started\t%llu\t0\t%d\t%d\t%s\t0\n",
+                   nsecs(monotonic), $dev->bus->busnum, $dev->devnum,
+                   $dev->devpath);
+        }
+    }
+}
+
+// BEGIN runs before attachment of the other probes, so it is not a ready signal.
+// A periodic kernel event instead provides evidence that the backend is alive.
+interval:s:5
+{
+    printf("PW1\theartbeat\t%llu\n", nsecs(monotonic));
+}
+
+END
+{
+    printf("PW1\tbackend_stopped\t%llu\n", nsecs(monotonic));
+    clear(@depth);
+    clear(@started);
+    clear(@bus);
+    clear(@address);
+    clear(@port);
+}
