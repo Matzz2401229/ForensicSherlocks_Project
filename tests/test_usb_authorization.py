@@ -5,8 +5,9 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "enforcement"))
-from usb_authorization import (BusManager, Config, EnforcementError, arm, load_config,
-                               load_state, restore, status)
+from usb_authorization import (BusManager, Config, DeviceController, DeviceEnforcer,
+                               EnforcementError, arm, authorize_device, load_config,
+                               load_state, reconcile, restore, revoke_device, status)
 
 
 class Fixture(unittest.TestCase):
@@ -36,6 +37,35 @@ class Fixture(unittest.TestCase):
 
     def read_bus(self, name):
         return (self.sysfs / name / "authorized_default").read_text(encoding="utf-8").strip()
+
+    def make_usb_device(self, usb_id, bus, address=5, vendor="058f", product="6387",
+                        serial="LAB-1", authorized="0"):
+        device = self.sysfs / usb_id
+        device.mkdir(parents=True, exist_ok=True)
+        values = {"idVendor": vendor, "idProduct": product, "busnum": str(bus),
+                  "devnum": str(address), "serial": serial, "bDeviceClass": "00",
+                  "authorized": authorized}
+        for name, value in values.items():
+            (device / name).write_text(value + "\n", encoding="utf-8")
+        return usb_id
+
+    def controller(self):
+        return DeviceController(root=self.sysfs)
+
+    def read_authorized(self, usb_id):
+        return (self.sysfs / usb_id / "authorized").read_text(encoding="utf-8").strip()
+
+    def write_policy(self, rules):
+        path = self.root / "allowlist.json"
+        document = {"schema_version": 1, "default_action": "block", "allowlist": rules}
+        path.write_text(json.dumps(document), encoding="utf-8")
+        return path
+
+    def allow_policy(self):
+        return self.write_policy([{"name": "lab", "vendor_id": "058f", "product_id": "6387"}])
+
+    def block_policy(self):
+        return self.write_policy([])
 
 
 class ConfigTests(Fixture):
@@ -166,6 +196,123 @@ class StatusTests(Fixture):
         self.assertTrue(after["armed"])
         self.assertTrue(after["buses"][0]["blocking_new_devices"])
         self.assertEqual(after["buses"][0]["original_default"], "1")
+
+
+class AuthorizeTests(Fixture):
+    def test_allowed_device_is_authorized(self):
+        self.make_usb_device("2-1", bus=2, authorized="0")
+        result = authorize_device(self.controller(), "2-1", self.allow_policy(), apply=True)
+        self.assertEqual(result["action"], "allow")
+        self.assertTrue(result["enforcement_applied"])
+        self.assertEqual(self.read_authorized("2-1"), "1")
+
+    def test_dry_run_does_not_write(self):
+        self.make_usb_device("2-1", bus=2, authorized="0")
+        result = authorize_device(self.controller(), "2-1", self.allow_policy(), apply=False)
+        self.assertEqual(result["action"], "allow")
+        self.assertFalse(result["enforcement_applied"])
+        self.assertEqual(self.read_authorized("2-1"), "0")
+
+    def test_unlisted_device_stays_blocked(self):
+        self.make_usb_device("2-1", bus=2, authorized="0")
+        result = authorize_device(self.controller(), "2-1", self.block_policy(), apply=True)
+        self.assertEqual(result["action"], "block")
+        self.assertFalse(result["enforcement_applied"])
+        self.assertEqual(self.read_authorized("2-1"), "0")
+
+    def test_identity_mismatch_refuses_authorisation(self):
+        # The device on the port reports a different serial than the decision expected.
+        self.make_usb_device("2-1", bus=2, serial="SWAPPED", authorized="0")
+        expected = {"vendor_id": "058f", "product_id": "6387", "serial": "LAB-1", "device_address": 5}
+        result = authorize_device(self.controller(), "2-1", self.allow_policy(),
+                                  expected=expected, apply=True)
+        self.assertEqual(result["action"], "block")
+        self.assertEqual(result["reason"], "identity_mismatch")
+        self.assertEqual(result["mismatch_field"], "serial")
+        self.assertEqual(self.read_authorized("2-1"), "0")
+
+    def test_revoke_blocks_device(self):
+        self.make_usb_device("2-1", bus=2, authorized="1")
+        result = revoke_device(self.controller(), "2-1", apply=True)
+        self.assertEqual(result["action"], "block")
+        self.assertEqual(self.read_authorized("2-1"), "0")
+
+
+class EnforcerTests(Fixture):
+    NOW = 10_000_000_000
+
+    def enforcer(self, policy_path, apply=True):
+        return DeviceEnforcer(self.controller(), policy_path, clock=lambda: self.NOW, apply=apply)
+
+    def decision(self, usb_id, action, device=None, age_ns=0, **extra):
+        ts = self.NOW - age_ns
+        return {"schema_version": 1, "type": "policy_decision", "action": action,
+                "usb_id": usb_id, "device": device, "decision_timestamp_ns": ts,
+                "event_timestamp_ns": ts, "connection_id": "c1", "session_id": "s1", **extra}
+
+    def test_allow_decision_authorizes_and_reports_latency(self):
+        self.make_usb_device("2-1", bus=2, authorized="0")
+        device = {"vendor_id": "058f", "product_id": "6387", "serial": "LAB-1", "device_address": 5}
+        record = self.decision("2-1", "allow", device=device, age_ns=100)
+        result = self.enforcer(self.allow_policy()).handle(record)
+        self.assertEqual(result["action"], "allow")
+        self.assertTrue(result["enforcement_applied"])
+        self.assertEqual(self.read_authorized("2-1"), "1")
+        self.assertEqual(result["enforcement_latency_ns"], 100)
+        self.assertEqual(result["connection_id"], "c1")
+
+    def test_block_decision_revokes_an_authorized_device(self):
+        self.make_usb_device("2-1", bus=2, authorized="1")
+        result = self.enforcer(self.block_policy()).handle(self.decision("2-1", "block"))
+        self.assertEqual(result["reason"], "revoked_unauthorised")
+        self.assertTrue(result["enforcement_applied"])
+        self.assertEqual(self.read_authorized("2-1"), "0")
+
+    def test_block_decision_leaves_already_blocked_device(self):
+        self.make_usb_device("2-1", bus=2, authorized="0")
+        result = self.enforcer(self.block_policy()).handle(self.decision("2-1", "block"))
+        self.assertEqual(result["reason"], "already_blocked")
+        self.assertFalse(result["enforcement_applied"])
+
+    def test_stale_decision_is_skipped(self):
+        self.make_usb_device("2-1", bus=2, authorized="0")
+        record = self.decision("2-1", "allow", age_ns=3_000_000_000)
+        result = self.enforcer(self.allow_policy()).handle(record)
+        self.assertEqual(result["type"], "enforcement_skipped")
+        self.assertEqual(result["reason"], "stale_decision")
+        self.assertEqual(self.read_authorized("2-1"), "0")
+
+    def test_non_decision_records_are_ignored(self):
+        record = {"schema_version": 1, "type": "policy_monitor_status", "healthy": True}
+        self.assertIsNone(self.enforcer(self.allow_policy()).handle(record))
+
+    def test_dry_run_enforcer_does_not_write(self):
+        self.make_usb_device("2-1", bus=2, authorized="0")
+        device = {"vendor_id": "058f", "product_id": "6387", "serial": "LAB-1", "device_address": 5}
+        result = self.enforcer(self.allow_policy(), apply=False).handle(
+            self.decision("2-1", "allow", device=device))
+        self.assertFalse(result["enforcement_applied"])
+        self.assertEqual(self.read_authorized("2-1"), "0")
+
+
+class ReconcileTests(Fixture):
+    def test_authorizes_allowed_leaves_others_blocked(self):
+        self.make_bus("usb2", "0")  # armed bus
+        self.make_usb_device("2-1", bus=2, vendor="058f", product="6387", authorized="0")
+        self.make_usb_device("2-2", bus=2, vendor="dead", product="beef", authorized="0")
+        result = reconcile(self.controller(), self.manager(("usb2",)), self.allow_policy(), apply=True)
+        actions = {row["usb_id"]: (row["action"], row["enforcement_applied"]) for row in result["devices"]}
+        self.assertEqual(actions["2-1"], ("allow", True))
+        self.assertEqual(actions["2-2"], ("block", False))
+        self.assertEqual(self.read_authorized("2-1"), "1")  # allowed device authorised
+        self.assertEqual(self.read_authorized("2-2"), "0")  # unlisted device left blocked
+
+    def test_skips_devices_on_unmanaged_buses(self):
+        self.make_bus("usb2", "0")
+        self.make_usb_device("2-1", bus=2, authorized="0")
+        self.make_usb_device("3-1", bus=3, authorized="0")  # bus 3 not managed here
+        result = reconcile(self.controller(), self.manager(("usb2",)), self.allow_policy(), apply=True)
+        self.assertEqual([row["usb_id"] for row in result["devices"]], ["2-1"])
 
 
 if __name__ == "__main__":
