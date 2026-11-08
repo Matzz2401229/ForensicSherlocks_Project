@@ -11,3 +11,10 @@
 /.venv/
 __pycache__/
 *.py[cod]
+
+# Local development records (never pushed; kept for report writing).
+# These files hold our raw notes and decisions. The IGNORE RULE travels with
+# the repo, but the files themselves do not (ignored files are never in git) --
+# copy docs/ by hand if the repo is ever moved or re-cloned.
+/docs/dev-log.md
+/docs/DEVELOPMENT-JOURNAL.md
