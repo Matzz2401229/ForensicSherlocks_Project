@@ -194,6 +194,9 @@ def _write_state_atomic(path, document):
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+        # NamedTemporaryFile creates the file 0600, so after a root arm a non-root `status`
+        # could not read it. It holds only bus names and 0/1 values, so make it world-readable.
+        os.chmod(tmp, 0o644)
         os.replace(tmp, path)
     finally:
         if tmp is not None and tmp.exists():

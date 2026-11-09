@@ -166,6 +166,12 @@ class ArmRestoreTests(Fixture):
         arm(self.manager(), self.state_file, apply=True)
         self.assertEqual(load_state(self.state_file)["buses"]["usb2"]["original_default"], "1")
 
+    @unittest.skipUnless(sys.platform != "win32", "POSIX file modes")
+    def test_state_file_is_readable_by_non_root(self):
+        self.make_bus("usb2", "1")
+        arm(self.manager(), self.state_file, apply=True)
+        self.assertEqual(self.state_file.stat().st_mode & 0o777, 0o644)
+
     def test_failed_write_part_way_still_leaves_originals_restorable(self):
         self.make_bus("usb2", "1")
         self.make_bus("usb3", "1")
