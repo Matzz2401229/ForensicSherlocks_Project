@@ -1,4 +1,5 @@
 import contextlib
+import errno
 import io
 import json
 from pathlib import Path
@@ -540,6 +541,140 @@ class StreamTests(Fixture):
         self.assertEqual(self.read_authorized("2-2"), "1")
         self.assertEqual(rows[-1]["failures"], 1)
         self.assertEqual(code, 1)  # the later success does not erase the earlier failure
+
+
+class _FailingRawDevice(io.RawIOBase):
+    """Exercise underlying I/O failures without touching a real USB device."""
+
+    def __init__(self, write_result=None):
+        super().__init__()
+        self.position = 0
+        self.write_calls = 0
+        self.write_result = write_result
+
+    def readable(self):
+        return True
+
+    def writable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def tell(self):
+        return self.position
+
+    def seek(self, offset, whence=0):
+        self.position = offset if whence == 0 else self.position + offset
+        return self.position
+
+    def readinto(self, buffer):
+        return 0
+
+    def write(self, data):
+        self.write_calls += 1
+        if self.write_result is not None:
+            return self.write_result
+        raise OSError(errno.ENODEV, "simulated device removed during write")
+
+
+class EnforcementFailureRegressionTests(Fixture):
+    NOW = 10_000_000_000
+
+    @staticmethod
+    def lines(*records):
+        return io.StringIO("".join(json.dumps({"schema_version": 1, **r}) + "\n" for r in records))
+
+    @staticmethod
+    def loss():
+        return {"type": "policy_monitor_status", "monitor_type": "monitor_loss",
+                "healthy": False, "degraded": True, "session_id": "session"}
+
+    def check_failed_stop(self, stream):
+        enforcer = DeviceEnforcer(self.controller(), self.allow_policy())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = process_stream(enforcer, stream)
+        closing = json.loads(out.getvalue().splitlines()[-1])
+        self.assertEqual(code, 1)
+        self.assertFalse(closing["ok"])
+
+    def test_monitor_loss_followed_by_upstream_requested_stop_fails(self):
+        self.check_failed_stop(self.lines(
+            self.loss(), {"type": "policy_stream_closed", "reason": "requested_stop"}))
+
+    def test_monitor_loss_followed_by_local_interrupt_fails(self):
+        def stream():
+            yield self.lines(self.loss()).getvalue()
+            raise KeyboardInterrupt
+        self.check_failed_stop(stream())
+
+    def test_policy_input_error_followed_by_requested_stop_fails(self):
+        self.check_failed_stop(self.lines(
+            {"type": "policy_input_error", "message": "invalid monitor input"},
+            {"type": "policy_stream_closed", "reason": "requested_stop"}))
+
+    def failing_open(self, raw, buffered=False):
+        real_open = Path.open
+        target = self.sysfs / "2-1" / "authorized"
+
+        def open_device(path, mode="r", *args, **kwargs):
+            if path == target and mode == "r+b":
+                # Respect the actual opening mode. For the cleanup regression,
+                # force a Python buffer so both flush and close will fail.
+                return io.BufferedRandom(raw) if buffered or kwargs.get("buffering") != 0 else raw
+            return real_open(path, mode, *args, **kwargs)
+        return mock.patch.object(Path, "open", new=open_device)
+
+    def check_failed_write(self, raw, action="allow", buffered=False):
+        self.make_usb_device("2-1", bus=2, address=5, authorized="1" if action == "block" else "0")
+        self.make_usb_device("2-2", bus=2, address=6, authorized="0")
+        enforcer = DeviceEnforcer(self.controller(), self.allow_policy(), clock=lambda: self.NOW)
+        decisions = [{"type": "policy_decision", "action": requested, "usb_id": usb_id,
+                      "device": {"device_address": address}, "decision_timestamp_ns": self.NOW,
+                      "connection_id": "boot:" + usb_id + ":1", "session_id": "session"}
+                     for usb_id, address, requested in (("2-1", 5, action), ("2-2", 6, "allow"))]
+        out = io.StringIO()
+        with self.failing_open(raw, buffered=buffered), contextlib.redirect_stdout(out):
+            code = process_stream(enforcer, self.lines(
+                *decisions, {"type": "policy_stream_closed", "reason": "requested_stop"}))
+        rows = [json.loads(line) for line in out.getvalue().splitlines()]
+        error = rows[0]
+        self.assertEqual(error["type"], "enforcement_error")
+        self.assertEqual(error["reason"], "sysfs_write_failed")
+        self.assertEqual(error["usb_id"], "2-1")
+        self.assertEqual(error["requested_action"], action)
+        self.assertEqual(error["connection_id"], "boot:2-1:1")
+        self.assertEqual(error["session_id"], "session")
+        self.assertFalse(error["enforcement_applied"])
+        self.assertEqual(self.read_authorized("2-2"), "1")
+        self.assertEqual(rows[-1]["failures"], 1)
+        self.assertFalse(rows[-1]["ok"])
+        self.assertEqual(code, 1)
+
+    def test_underlying_write_failure_keeps_context_and_continues(self):
+        for action in ("allow", "block"):
+            with self.subTest(action=action):
+                raw = _FailingRawDevice()
+                self.check_failed_write(raw, action=action)
+                self.assertEqual(raw.write_calls, 1)  # no implicit retry on close
+
+    def test_buffered_cleanup_does_not_replace_the_write_error(self):
+        self.check_failed_write(_FailingRawDevice(), buffered=True)
+
+    def test_incomplete_write_is_reported_as_failure(self):
+        self.check_failed_write(_FailingRawDevice(write_result=1))
+
+    def test_reconcile_continues_after_underlying_write_failure(self):
+        self.make_bus("usb2", "0")
+        self.make_usb_device("2-1", bus=2, authorized="0")
+        self.make_usb_device("2-2", bus=2, address=6, authorized="0")
+        with self.failing_open(_FailingRawDevice()):
+            result = reconcile(self.controller(), self.manager(("usb2",)), self.allow_policy())
+        self.assertEqual(result["failures"], 1)
+        self.assertEqual(result["devices"][0]["type"], "enforcement_error")
+        self.assertEqual(result["devices"][0]["usb_id"], "2-1")
+        self.assertEqual(self.read_authorized("2-2"), "1")
 
 
 class ReviewRegressionTests(Fixture):

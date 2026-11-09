@@ -306,7 +306,10 @@ class DeviceHandle:
         self.directory = Path(root) / usb_id
         self.instance = self._current_instance()
         try:
-            self.file = (self.directory / "authorized").open("r+b" if writable else "rb")
+            # These are tiny sysfs commands. Do not queue them for a later flush or
+            # retry a failed write implicitly when the handle is closed.
+            self.file = (self.directory / "authorized").open(
+                "r+b" if writable else "rb", buffering=0)
         except FileNotFoundError as error:
             raise DeviceError("device_unavailable", f"Device {usb_id} is not present") from error
         except OSError as error:
@@ -332,19 +335,32 @@ class DeviceHandle:
         self.check()
         try:
             self.file.seek(0)
-            self.file.write(value.encode("ascii") + b"\n")
+            payload = value.encode("ascii") + b"\n"
+            written = self.file.write(payload)
+            if written != len(payload):
+                raise EnforcementError(
+                    f"Incomplete authorized write for {self.usb_id}: {written!r} of {len(payload)} bytes")
             self.file.flush()
         except OSError as error:
             raise EnforcementError(f"Cannot write authorized for {self.usb_id}: {error}") from error
 
     def close(self):
-        self.file.close()
+        try:
+            self.file.close()
+        except OSError as error:
+            raise EnforcementError(f"Cannot close authorized for {self.usb_id}: {error}") from error
 
     def __enter__(self):
         return self
 
-    def __exit__(self, *exc_info):
-        self.close()
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            self.close()
+        except EnforcementError:
+            # Cleanup must not replace the original write/device error and bypass
+            # its per-device handler. Report a close failure if there was no error.
+            if exc_type is None:
+                raise
 
 
 class DeviceController:
@@ -498,7 +514,8 @@ class DeviceEnforcer:
         else:
             reason = "unexpected_end_of_input"
         clean_stop = reason in ("requested_stop", "upstream_requested_stop", "upstream_stopped")
-        return reason, clean_stop and not self.failures and not self.input_errors
+        return reason, (clean_stop and not self.upstream_degraded
+                        and not self.failures and not self.input_errors)
 
     def _ensure_blocked(self, usb_id, expected):
         with self.controller.bind(usb_id, writable=self.apply) as handle:
