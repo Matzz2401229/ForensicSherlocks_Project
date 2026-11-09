@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "managed_buses": ["usb2", "usb3"],
+  "state_file": "logs/enforcement-state.json"
+}

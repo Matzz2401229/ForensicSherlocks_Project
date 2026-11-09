@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "managed_buses": "auto",
+  "state_file": "logs/enforcement-state.json"
+}
