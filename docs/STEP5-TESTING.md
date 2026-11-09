@@ -90,11 +90,21 @@ sudo python3 src/monitor/usb_monitor.py |
   sudo python3 src/enforcement/usb_authorization.py --policy config/allowlist.example.json enforce
 ```
 
-Wait for a healthy monitor, then connect the drive. Expect an `enforcement_result`
-with `action: allow`, `enforcement_applied: true`, and an `enforcement_latency_ns`
-(insertion to authorisation). Confirm the drive now appears in `lsblk`. Connect a
-different, unlisted device and expect `action: block` with the device left blocked.
-Press Ctrl+C to stop; confirm the backend is gone:
+`enforce` prints `enforcement_started` immediately, then an `enforcement_monitor_status`
+record when the monitor's health changes. Wait for one with `healthy: true` (about five
+seconds), then connect the drive. Heartbeats are not repeated, so the screen stays quiet
+until a device appears. A device inserted before the monitor is healthy gets a `block`
+decision (the step 4 safety rule), not an authorisation.
+
+Expect an `enforcement_result` with `action: allow`, `enforcement_applied: true`,
+`policy_reason: allowlist_match` and an `enforcement_latency_ns` (insertion to
+authorisation). Confirm the drive now appears in `lsblk`. To test the unlisted case, run
+the same pipeline without `--policy` (the default policy has no rules): the result is
+`action: block`, `reason: already_blocked`, `policy_reason: no_matching_allowlist_rule`,
+and the drive stays absent from `lsblk`.
+
+Press Ctrl+C to stop. `enforce` ends with an `enforcement_stream_closed` record
+(`reason: requested_stop`) and no traceback. Confirm the backend is gone:
 
 ```bash
 pgrep -af 'bpftrace.*usb_events[.]bt'          # no matches expected
@@ -112,8 +122,12 @@ python3 src/enforcement/usb_authorization.py --policy config/allowlist.example.j
 sudo python3 src/enforcement/usb_authorization.py --policy config/allowlist.example.json reconcile --apply
 ```
 
-Expect the allowed drive to be authorised and appear in `lsblk`. Non-allowed devices
-already present (hubs, virtual input) are reported but left blocked, not revoked.
+Expect the allowed drive to be authorised (`action: allow`, `enforcement_applied: true`)
+and appear in `lsblk`. Devices that are not allowlisted are never revoked. One that is
+still blocked is reported as `action: block`. One that was already authorised, such as the
+VMware hubs and virtual mouse, is reported as `action: unchanged` with
+`reason: not_allowlisted_left_unchanged` and `enforcement_applied: false`, so it cannot be
+mistaken for a device that was blocked. The policy's own reason is in `policy_reason`.
 
 ## Clean up
 

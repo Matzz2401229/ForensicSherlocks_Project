@@ -4,7 +4,7 @@ PortWatchman is a Linux USB monitoring, allowlisting, and enforcement project de
 
 The intended behaviour is to keep newly connected USB devices blocked until their reported attributes satisfy the allowlist. Unapproved devices remain blocked and can trigger a configured response, such as session locking or shutdown.
 
-**Current implementation:** USB monitoring and device identification/allowlist decisions are implemented and tested. Automatic USB enforcement, the integrated BPF-LSM layer, response actions, and the running service are still planned. An `allow` or `block` decision currently does not change device access; policy output reports `enforcement_applied: false`.
+**Current implementation:** USB monitoring, device identification/allowlist decisions, and USB access control are implemented and tested. Access control sets default-deny on managed USB buses, authorises allowed devices after re-validating them, keeps unapproved devices blocked, and reconciles devices connected before it started. The integrated BPF-LSM layer, response actions, and the running service are still planned. The policy watcher on its own still reports `enforcement_applied: false`; device access changes only when its decisions are piped into the enforcement stage.
 
 ## Architecture
 
@@ -29,6 +29,7 @@ The currently implemented pipeline is:
 
 ```text
 USB event -> eBPF monitor -> JSON event -> device identification -> allow/block decision
+  -> re-validation -> USB authorisation (authorise or keep blocked)
 ```
 
 ## Development environment
@@ -39,7 +40,7 @@ Development and live testing currently target one Ubuntu VM configuration:
 | --- | --- |
 | Guest operating system | Ubuntu 24.04.5 LTS |
 | Virtualisation | VMware on a Windows laptop, with USB passthrough |
-| Kernel | `7.0.0-38-generic` |
+| Kernel | `7.0.0-38-generic`; `7.0.0-42-generic` for step 5 live tests |
 | Monitoring backend | bpftrace `0.20.2` |
 | BPF development tools | Clang `18.1.3`, libbpf `1.3.0` |
 | Python | Python 3.10 or later; standard library only for current components |
@@ -72,7 +73,7 @@ The combined application entry point and service installation commands are not i
 # TODO: Add service installation, start, status, and stop commands.
 ```
 
-Until then, use the monitoring and policy commands below.
+Until then, use the monitoring, policy, and access-control commands below.
 
 ### Check prerequisites and policy
 
@@ -160,6 +161,44 @@ python3 src/policy/device_policy.py --policy config/allowlist.example.json evalu
 
 USB IDs and bus numbers can change across boots or VM configuration changes. Confirm the vendor/product IDs before selecting a device. `kernel_authorized` describes the existing kernel state; `action` describes the policy decision.
 
+### USB access control
+
+These commands change USB authorisation in sysfs, so they affect device access **inside the Ubuntu VM only**. Every write command is a dry run that changes nothing unless you add `--apply`; writes need `sudo`. After `arm --apply`, any newly connected device (including a USB mouse or keyboard passed through to the VM) starts blocked until it is authorised, so keep the VMware console available. `restore --apply` undoes default-deny.
+
+Check the managed buses, then set default-deny and later restore it:
+
+```bash
+python3 src/enforcement/usb_authorization.py status
+sudo python3 src/enforcement/usb_authorization.py arm --apply
+sudo python3 src/enforcement/usb_authorization.py restore --apply
+```
+
+With default-deny armed, run the full pipeline so allowed devices are authorised automatically and others stay blocked. Use the same policy for `watch` and `enforce`:
+
+```bash
+sudo -v
+sudo python3 src/monitor/usb_monitor.py |
+  python3 src/policy/device_policy.py --policy config/allowlist.example.json watch |
+  sudo python3 src/enforcement/usb_authorization.py --policy config/allowlist.example.json enforce
+```
+
+Wait for an `enforcement_monitor_status` record with `healthy: true`, then connect the device. Each device produces an `enforcement_result` with `action` (`allow` or `block`), `enforcement_applied`, the policy's `policy_reason`, and `enforcement_latency_ns`. Press **Ctrl+C** to stop; the stage ends with an `enforcement_stream_closed` record.
+
+To handle devices that were already connected before the pipeline started:
+
+```bash
+sudo python3 src/enforcement/usb_authorization.py --policy config/allowlist.example.json reconcile --apply
+```
+
+Single devices can also be authorised (after re-validation against the policy) or revoked:
+
+```bash
+sudo python3 src/enforcement/usb_authorization.py --policy config/allowlist.example.json authorize 2-1 --apply
+sudo python3 src/enforcement/usb_authorization.py revoke 2-1 --apply
+```
+
+Find the USB ID with `device_policy.py list` first. See [step 5 testing](docs/STEP5-TESTING.md) for the full procedure.
+
 ## Allowlist configuration
 
 The default policy is `config/allowlist.json`:
@@ -192,6 +231,20 @@ These values identify the current lab drive. Inspect your own device before addi
 
 The global `--policy` option goes **before** the command. The watcher reloads the policy for each new setup-completed event. Policy edits do not currently revoke existing access or re-evaluate previously processed connections.
 
+## Access-control configuration
+
+`config/enforcement.json` selects the buses that receive default-deny and where the original bus settings are saved:
+
+```json
+{
+  "schema_version": 1,
+  "managed_buses": "auto",
+  "state_file": "logs/enforcement-state.json"
+}
+```
+
+`"auto"` manages every USB bus. This is the default because the same device can enumerate on a different controller across reconnects, which would bypass default-deny on an unmanaged bus. To manage specific buses, list them, for example `["usb2", "usb3"]` (see `config/enforcement.example.json`). The original `authorized_default` values are saved before any bus is changed, so `restore` returns the true originals even if `arm` runs more than once.
+
 ## Directory structure
 
 Current repository layout:
@@ -203,19 +256,25 @@ portwatchman/
 ├── .gitignore
 ├── config/
 │   ├── allowlist.json               # Default policy: block, no rules
-│   └── allowlist.example.json       # Example lab-device rule
+│   ├── allowlist.example.json       # Example lab-device rule
+│   ├── enforcement.json             # Access control: managed buses ("auto"), state file
+│   └── enforcement.example.json     # Example with explicit bus list
 ├── src/
 │   ├── monitor/
 │   │   ├── usb_events.bt           # eBPF probe definitions
 │   │   └── usb_monitor.py          # Monitor supervision and JSON output
-│   └── policy/
-│       └── device_policy.py        # Identification, policy rules, and CLI
+│   ├── policy/
+│   │   └── device_policy.py        # Identification, policy rules, and CLI
+│   └── enforcement/
+│       └── usb_authorization.py    # Default-deny, authorise/revoke, enforce, reconcile
 ├── tests/
 │   ├── test_usb_monitor.py
-│   └── test_device_policy.py
+│   ├── test_device_policy.py
+│   └── test_usb_authorization.py
 ├── docs/
 │   ├── STEP3-TESTING.md
-│   └── STEP4-TESTING.md
+│   ├── STEP4-TESTING.md
+│   └── STEP5-TESTING.md
 ├── logs/                           # Local output; created as needed, ignored
 └── build/                          # Local build/test files; ignored
 ```
@@ -224,7 +283,7 @@ Planned additions — these paths are placeholders and may change during impleme
 
 ```text
 src/
-├── enforcement/                    # USB authorisation and BPF-LSM components
+├── enforcement/                    # Supplementary BPF-LSM component (alongside usb_authorization.py)
 ├── responses/                      # Configurable response actions
 └── daemon/                         # Application lifecycle and integration
 config/
@@ -241,7 +300,9 @@ python3 -m unittest discover -s tests -p 'test_*.py' -v
 
 At completion of step 4, all **58 tests** passed in the Ubuntu VM. Live tests also verified USB reconnection monitoring, connection correlation, allowlist matches and mismatches, identification while unauthorised, and normal backend cleanup.
 
-See [step 3 testing](docs/STEP3-TESTING.md) and [step 4 testing](docs/STEP4-TESTING.md) for detailed procedures. Treat device IDs in those guides as examples and rediscover the current topology before testing.
+Step 5 brings the suite to **102 tests**; the access-control tests use a simulated sysfs tree and need no root or USB device. Live tests in the Ubuntu VM verified that default-deny keeps a newly connected drive blocked, that authorise and revoke change real device access, that the pipeline authorises an allowlisted drive automatically while an unlisted drive stays blocked, that reconcile authorises an allowed drive connected beforehand without revoking the VMware virtual mouse or hubs, and that restore returns every bus to its original setting.
+
+See [step 3 testing](docs/STEP3-TESTING.md), [step 4 testing](docs/STEP4-TESTING.md), and [step 5 testing](docs/STEP5-TESTING.md) for detailed procedures. Treat device IDs in those guides as examples and rediscover the current topology before testing.
 
 ## Implementation progress
 
@@ -249,7 +310,7 @@ See [step 3 testing](docs/STEP3-TESTING.md) and [step 4 testing](docs/STEP4-TEST
 - [x] 2. Validate technical feasibility in the Ubuntu VM.
 - [x] 3. Implement USB event monitoring.
 - [x] 4. Implement device identification and allowlisting.
-- [ ] 5. Implement automatic USB access control.
+- [x] 5. Implement automatic USB access control.
 - [ ] 6. Implement supplementary BPF-LSM enforcement.
 - [ ] 7. Implement configurable responses.
 - [ ] 8. Integrate components into a running service.
@@ -259,10 +320,12 @@ See [step 3 testing](docs/STEP3-TESTING.md) and [step 4 testing](docs/STEP4-TEST
 
 ## Scope and limitations
 
-- USB authorisation and a narrow BPF-LSM test have been demonstrated manually. They are not yet integrated with policy decisions.
+- USB authorisation is integrated with policy decisions and controls whole devices. It does not restrict individual interfaces of a composite device (for example, a device that also presents a keyboard); that is left to the supplementary BPF-LSM layer.
+- Default-deny affects devices connected after `arm`. Devices already connected keep their access; `reconcile` authorises allowed ones but does not revoke the others.
+- Before authorising, the enforcement stage re-reads the device and re-checks the policy. This narrows, but cannot close, the window in which a different device could replace the approved one.
 - BPF-LSM feasibility testing restricted new opens of one designated USB test file. It does not establish whole-volume, raw-device, or all-interface enforcement.
 - Vendor/product IDs and serial numbers are device-reported attributes and can be spoofed. A policy match does not authenticate physical identity.
-- The current watcher processes new setup events. Automatic startup inventory, recovery reconciliation, and existing-device enforcement remain planned.
+- The watcher processes new setup events; `reconcile` handles devices connected before startup and must currently be run by hand. Running it automatically on service start and after recovery remains planned.
 - Current JSON output supports development testing; durable audit logging and service supervision remain planned.
 - Session locking, shutdown/reboot, secure deletion, and data sanitisation are not implemented. Secure deletion and sanitisation require further feasibility work; reliable evidence erasure is not an established project capability.
 - Timing measurements inside VMware describe guest behaviour. They do not establish physical insertion latency or erase data retained by the Windows host or VM snapshots.

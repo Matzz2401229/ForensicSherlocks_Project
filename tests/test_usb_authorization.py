@@ -1,13 +1,18 @@
+import contextlib
+import io
 import json
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "enforcement"))
+import usb_authorization
 from usb_authorization import (BusManager, Config, DeviceController, DeviceEnforcer,
                                EnforcementError, arm, authorize_device, load_config,
-                               load_state, reconcile, restore, revoke_device, status)
+                               load_state, main, process_stream, reconcile, restore,
+                               revoke_device, status)
 
 
 class Fixture(unittest.TestCase):
@@ -161,6 +166,26 @@ class ArmRestoreTests(Fixture):
         arm(self.manager(), self.state_file, apply=True)
         self.assertEqual(load_state(self.state_file)["buses"]["usb2"]["original_default"], "1")
 
+    def test_failed_write_part_way_still_leaves_originals_restorable(self):
+        self.make_bus("usb2", "1")
+        self.make_bus("usb3", "1")
+        manager = self.manager()
+        real_write = manager.write_default
+
+        def fail_on_usb3(bus, value):
+            if bus == "usb3":
+                raise EnforcementError("simulated sysfs write failure")
+            real_write(bus, value)
+
+        manager.write_default = fail_on_usb3
+        with self.assertRaises(EnforcementError):
+            arm(manager, self.state_file, apply=True)
+        self.assertEqual(self.read_bus("usb2"), "0")  # changed before the failure
+        saved = load_state(self.state_file)["buses"]
+        self.assertEqual(saved["usb2"]["original_default"], "1")  # still recoverable
+        restore(self.manager(), self.state_file, apply=True)
+        self.assertEqual(self.read_bus("usb2"), "1")
+
     def test_restore_puts_back_original_and_clears_state(self):
         self.make_bus("usb2", "1")
         self.make_bus("usb3", "0")  # a bus that was already default-deny before us
@@ -282,9 +307,52 @@ class EnforcerTests(Fixture):
         self.assertEqual(result["reason"], "stale_decision")
         self.assertEqual(self.read_authorized("2-1"), "0")
 
-    def test_non_decision_records_are_ignored(self):
-        record = {"schema_version": 1, "type": "policy_monitor_status", "healthy": True}
-        self.assertIsNone(self.enforcer(self.allow_policy()).handle(record))
+    def test_allow_without_timestamp_is_refused(self):
+        self.make_usb_device("2-1", bus=2, authorized="0")
+        record = self.decision("2-1", "allow")
+        del record["decision_timestamp_ns"]
+        result = self.enforcer(self.allow_policy()).handle(record)
+        self.assertEqual(result["reason"], "stale_decision")
+        self.assertEqual(self.read_authorized("2-1"), "0")
+
+    def test_block_without_timestamp_is_still_enforced(self):
+        self.make_usb_device("2-1", bus=2, authorized="1")
+        record = self.decision("2-1", "block")
+        del record["decision_timestamp_ns"]
+        result = self.enforcer(self.block_policy()).handle(record)
+        self.assertEqual(result["reason"], "revoked_unauthorised")
+        self.assertEqual(self.read_authorized("2-1"), "0")
+
+    def test_skip_and_close_records_are_ignored(self):
+        enforcer = self.enforcer(self.allow_policy())
+        for kind in ("policy_skipped", "policy_stream_closed"):
+            self.assertIsNone(enforcer.handle({"schema_version": 1, "type": kind}))
+
+    def test_monitor_health_is_reported_only_when_it_changes(self):
+        enforcer = self.enforcer(self.allow_policy())
+        status_record = lambda healthy: {"schema_version": 1, "type": "policy_monitor_status",
+                                         "healthy": healthy, "degraded": False,
+                                         "monitor_type": "monitor_heartbeat", "session_id": "s1"}
+        first = enforcer.handle(status_record(False))
+        self.assertEqual((first["type"], first["healthy"]), ("enforcement_monitor_status", False))
+        self.assertIsNone(enforcer.handle(status_record(False)))  # unchanged: no heartbeat noise
+        self.assertTrue(enforcer.handle(status_record(True))["healthy"])
+        self.assertIsNone(enforcer.handle(status_record(True)))
+        self.assertFalse(enforcer.handle(status_record(False))["healthy"])  # a drop is reported
+
+    def test_policy_reason_is_carried_into_block_result(self):
+        self.make_usb_device("2-1", bus=2, authorized="0")
+        record = self.decision("2-1", "block", reason="no_matching_allowlist_rule")
+        result = self.enforcer(self.block_policy()).handle(record)
+        self.assertEqual(result["reason"], "already_blocked")
+        self.assertEqual(result["policy_reason"], "no_matching_allowlist_rule")
+
+    def test_policy_reason_is_carried_into_allow_result(self):
+        self.make_usb_device("2-1", bus=2, authorized="0")
+        device = {"vendor_id": "058f", "product_id": "6387", "serial": "LAB-1", "device_address": 5}
+        record = self.decision("2-1", "allow", device=device, reason="allowlist_match")
+        result = self.enforcer(self.allow_policy()).handle(record)
+        self.assertEqual(result["policy_reason"], "allowlist_match")
 
     def test_dry_run_enforcer_does_not_write(self):
         self.make_usb_device("2-1", bus=2, authorized="0")
@@ -293,6 +361,64 @@ class EnforcerTests(Fixture):
             self.decision("2-1", "allow", device=device))
         self.assertFalse(result["enforcement_applied"])
         self.assertEqual(self.read_authorized("2-1"), "0")
+
+
+class StreamTests(Fixture):
+    def run_stream(self, stream):
+        enforcer = DeviceEnforcer(self.controller(), self.allow_policy(), clock=lambda: 10_000_000_000)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = process_stream(enforcer, stream)
+        return code, [json.loads(line) for line in out.getvalue().splitlines()]
+
+    def test_end_of_input_closes_the_stream(self):
+        code, records = self.run_stream(io.StringIO("\n"))
+        self.assertEqual(code, 0)
+        self.assertEqual(records[-1]["type"], "enforcement_stream_closed")
+        self.assertEqual(records[-1]["reason"], "end_of_input")
+
+    def test_ctrl_c_is_a_clean_requested_stop(self):
+        class Interrupted:
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                raise KeyboardInterrupt
+
+        code, records = self.run_stream(Interrupted())  # no traceback escapes
+        self.assertEqual(code, 0)
+        self.assertEqual(records, [{"schema_version": 1, "type": "enforcement_stream_closed",
+                                    "reason": "requested_stop"}])
+
+    def test_malformed_line_is_reported_not_fatal(self):
+        code, records = self.run_stream(io.StringIO("not json\n"))
+        self.assertEqual(code, 0)
+        self.assertEqual(records[0]["type"], "enforcement_input_error")
+        self.assertEqual(records[-1]["type"], "enforcement_stream_closed")
+
+
+class CliErrorTests(Fixture):
+    def run_cli(self, *args):
+        config = self.root / "enforcement.json"
+        config.write_text(json.dumps({"schema_version": 1}), encoding="utf-8")
+        out, err = io.StringIO(), io.StringIO()
+        argv = ["--config", str(config), "--usb-root", str(self.sysfs), *args]
+        # Skip the Linux-only guard so the real error paths run on any platform.
+        with mock.patch.object(usb_authorization, "require_linux"), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = main(argv)
+        return code, json.loads(out.getvalue())
+
+    def test_unreadable_policy_is_a_json_error(self):
+        self.make_usb_device("2-1", bus=2)
+        code, record = self.run_cli("--policy", str(self.root / "missing.json"), "authorize", "2-1")
+        self.assertEqual(code, 2)
+        self.assertEqual(record["type"], "enforcement_error")
+
+    def test_malformed_usb_id_is_a_json_error(self):
+        code, record = self.run_cli("--policy", str(self.allow_policy()), "authorize", "bogus")
+        self.assertEqual(code, 2)
+        self.assertEqual(record["type"], "enforcement_error")
 
 
 class ReconcileTests(Fixture):
@@ -306,6 +432,24 @@ class ReconcileTests(Fixture):
         self.assertEqual(actions["2-2"], ("block", False))
         self.assertEqual(self.read_authorized("2-1"), "1")  # allowed device authorised
         self.assertEqual(self.read_authorized("2-2"), "0")  # unlisted device left blocked
+
+    def test_authorised_unlisted_device_is_unchanged_not_block(self):
+        self.make_bus("usb2", "0")
+        # An input device that was already authorised before arming and is not allowlisted.
+        self.make_usb_device("2-2", bus=2, vendor="dead", product="beef", authorized="1")
+        result = reconcile(self.controller(), self.manager(("usb2",)), self.allow_policy(), apply=True)
+        row = result["devices"][0]
+        self.assertEqual(row["action"], "unchanged")
+        self.assertEqual(row["reason"], "not_allowlisted_left_unchanged")
+        self.assertEqual(row["policy_reason"], "no_matching_allowlist_rule")
+        self.assertFalse(row["enforcement_applied"])
+        self.assertEqual(self.read_authorized("2-2"), "1")  # never revoked
+
+    def test_blocked_unlisted_device_is_still_reported_as_block(self):
+        self.make_bus("usb2", "0")
+        self.make_usb_device("2-2", bus=2, vendor="dead", product="beef", authorized="0")
+        result = reconcile(self.controller(), self.manager(("usb2",)), self.allow_policy(), apply=True)
+        self.assertEqual(result["devices"][0]["action"], "block")
 
     def test_skips_devices_on_unmanaged_buses(self):
         self.make_bus("usb2", "0")

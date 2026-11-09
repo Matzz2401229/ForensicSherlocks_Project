@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
-"""Arm and restore USB default-deny on managed buses (step 5, slice 1).
+"""Enforce USB access control with Linux USB authorisation (step 5).
 
-This module manages the per-bus ``authorized_default`` flag in sysfs so that newly
-connected USB devices start blocked. It deliberately does NOT yet make per-device
-allow/block decisions or write per-device ``authorized`` flags -- that is slice 2.
+Keeps new USB devices blocked until approved, then authorises permitted devices:
+- Bus level: ``arm`` sets ``authorized_default=0`` on managed buses so new devices
+  start blocked; ``restore`` puts the saved originals back; ``status`` reports them.
+- Device level: ``authorize`` re-validates one device and writes ``authorized=1`` only
+  if it still matches the policy; ``revoke`` writes ``authorized=0``.
+- ``enforce`` reads the policy watcher's decisions on stdin and acts on each one;
+  ``reconcile`` handles devices that were connected before the service started.
 
 Design notes:
 - The sysfs root is injectable so the logic is unit-testable without real hardware.
-
-- ``arm`` defaults to a dry run: it prints what it would write and changes nothing.
-  Real writes require ``--apply`` (and root privileges on a live system).
-
-- Original ``authorized_default`` values are saved to a state file on the first arm
-  and are never overwritten by a re-arm, so ``restore`` always puts back the true
-  pre-PortWatchman values even if ``arm`` is run several times.
-  
-- The multi-controller finding (a device can enumerate on different buses across
-  reconnects) is why ``auto`` mode arms every bus, not a single controller.
+- Every write command is a dry run unless ``--apply`` is given (``enforce`` writes
+  unless ``--dry-run``). Real writes need root on a live system.
+- Original ``authorized_default`` values are saved before any bus is changed and are
+  never overwritten by a re-arm, so ``restore`` always returns the true originals.
+- ``auto`` mode arms every bus because a device can enumerate on a different
+  controller across reconnects.
 """
 from __future__ import annotations
 
@@ -56,6 +56,34 @@ class EnforcementError(RuntimeError):
 def emit(record):
     """Print one record as a single schema-tagged JSON line (the shared NDJSON format)."""
     print(json.dumps({"schema_version": SCHEMA_VERSION, **record}, separators=(",", ":")), flush=True)
+
+
+def require_linux():
+    if sys.platform != "linux":
+        raise EnforcementError("Live USB authorisation runs inside the Ubuntu VM")
+
+
+def bus_number(bus):
+    """Bus number of a root-hub name such as usb2."""
+    return int(ROOT_ID.fullmatch(bus)[1])
+
+
+def _list_entries(root):
+    try:
+        return list(root.iterdir())
+    except OSError as error:
+        raise EnforcementError(f"Cannot list USB root {root}: {error}") from error
+
+
+def _write_flag(path, value, what):
+    """Write a sysfs 0/1 flag, refusing any other value."""
+    if value not in ("0", "1"):
+        raise EnforcementError(f"Refusing to write invalid {what}: {value!r}")
+    try:
+        with path.open("w", encoding="utf-8") as handle:
+            handle.write(value + "\n")
+    except OSError as error:
+        raise EnforcementError(f"Cannot write {what}: {error}") from error
 
 
 @dataclass
@@ -124,26 +152,21 @@ class BusManager:
     def _default_path(self, bus):
         return self.root / bus / "authorized_default"
 
+    def has_bus(self, bus):
+        return self._default_path(bus).exists()
+
     def discover(self):
         """Return the sorted list of managed bus names that exist on this host."""
         if self.config.managed_buses == "auto":
-            try:
-                entries = list(self.root.iterdir())
-            except OSError as error:
-                raise EnforcementError(f"Cannot list USB root {self.root}: {error}") from error
-            found = [p.name for p in entries
-                     if ROOT_ID.fullmatch(p.name) and self._default_path(p.name).exists()]
+            found = [p.name for p in _list_entries(self.root)
+                     if ROOT_ID.fullmatch(p.name) and self.has_bus(p.name)]
             if not found:
                 raise EnforcementError(f"No USB buses with authorized_default under {self.root}")
-            return sorted(found, key=self._bus_sort_key)
-        missing = [bus for bus in self.config.managed_buses if not self._default_path(bus).exists()]
+            return sorted(found, key=bus_number)
+        missing = [bus for bus in self.config.managed_buses if not self.has_bus(bus)]
         if missing:
             raise EnforcementError(f"Configured buses not found on this host: {', '.join(missing)}")
-        return sorted(self.config.managed_buses, key=self._bus_sort_key)
-
-    @staticmethod
-    def _bus_sort_key(bus):
-        return int(ROOT_ID.fullmatch(bus)[1])
+        return sorted(self.config.managed_buses, key=bus_number)
 
     def read_default(self, bus):
         try:
@@ -155,13 +178,7 @@ class BusManager:
         return value
 
     def write_default(self, bus, value):
-        if value not in ("0", "1"):
-            raise EnforcementError(f"Refusing to write invalid authorized_default: {value!r}")
-        try:
-            with self._default_path(bus).open("w", encoding="utf-8") as handle:
-                handle.write(value + "\n")
-        except OSError as error:
-            raise EnforcementError(f"Cannot write authorized_default for {bus}: {error}") from error
+        _write_flag(self._default_path(bus), value, f"authorized_default for {bus}")
 
 
 def _write_state_atomic(path, document):
@@ -213,13 +230,14 @@ def arm(manager, state_path, apply=False):
                         "will_set": "0", "already_blocking": current == "0",
                         "original_recorded": already_saved})
     if apply:
+        # Record every original before changing any bus, so a write that fails part-way
+        # still leaves restore able to put back the buses that were already changed.
         for action in actions:
-            bus = action["bus"]
-            if bus not in saved:
-                saved[bus] = {"original_default": action["original_default"]}
-            manager.write_default(bus, "0")
+            saved.setdefault(action["bus"], {"original_default": action["original_default"]})
         state["armed_at"] = time.time()
         _write_state_atomic(Path(state_path), state)
+        for action in actions:
+            manager.write_default(action["bus"], "0")
     return {"type": "enforcement_arm", "applied": apply, "dry_run": not apply,
             "state_file": str(state_path), "buses": actions}
 
@@ -232,11 +250,11 @@ def restore(manager, state_path, apply=False):
                 "state_file": str(state_path), "buses": [],
                 "message": "No state file; nothing to restore"}
     actions = []
-    for bus, record in sorted(state["buses"].items(), key=lambda kv: BusManager._bus_sort_key(kv[0])):
+    for bus, record in sorted(state["buses"].items(), key=lambda item: bus_number(item[0])):
         original = record.get("original_default")
         if original not in ("0", "1"):
             raise EnforcementError(f"State file has invalid original_default for {bus}: {original!r}")
-        present = manager._default_path(bus).exists()
+        present = manager.has_bus(bus)
         current = manager.read_default(bus) if present else None
         actions.append({"bus": bus, "current_default": current, "restore_to": original,
                         "present": present})
@@ -283,23 +301,13 @@ class DeviceController:
         return self.reader.read(usb_id, expected_address=expected_address)
 
     def set_authorized(self, usb_id, value):
-        if value not in ("0", "1"):
-            raise EnforcementError(f"Refusing to write invalid authorized value: {value!r}")
-        try:
-            with self._authorized_path(usb_id).open("w", encoding="utf-8") as handle:
-                handle.write(value + "\n")
-        except OSError as error:
-            raise EnforcementError(f"Cannot write authorized for {usb_id}: {error}") from error
+        _write_flag(self._authorized_path(usb_id), value, f"authorized for {usb_id}")
 
     def managed_device_ids(self, buses):
         """Non-root devices currently present on the given managed buses, sorted."""
-        bus_numbers = {int(ROOT_ID.fullmatch(bus)[1]) for bus in buses}
+        bus_numbers = {bus_number(bus) for bus in buses}
         found = []
-        try:
-            entries = list(self.root.iterdir())
-        except OSError as error:
-            raise EnforcementError(f"Cannot list USB root {self.root}: {error}") from error
-        for entry in entries:
+        for entry in _list_entries(self.root):
             try:
                 bus, is_root = identifier(entry.name)
             except ValueError:
@@ -355,11 +363,10 @@ def authorize_device(controller, usb_id, policy_path, expected=None, apply=True)
 
 def revoke_device(controller, usb_id, apply=True):
     """Block a device by writing authorized=0, whatever the policy says."""
-    device = None
     try:
         device = controller.read(usb_id)
     except DeviceError:
-        device = None
+        device = None  # still block it: an unreadable device must not stay authorised
     if apply:
         controller.set_authorized(usb_id, "0")
     return _result("block", usb_id, device, applied=apply, reason="revoked")
@@ -375,6 +382,17 @@ class DeviceEnforcer:
         self.clock = clock
         self.max_age_ns = max_age_ns
         self.apply = apply
+        self.monitor_healthy = None
+
+    def _monitor_status(self, record):
+        """Report monitor health only when it changes, so readiness is visible without heartbeat noise."""
+        healthy = record.get("healthy")
+        if type(healthy) is not bool or healthy == self.monitor_healthy:
+            return None
+        self.monitor_healthy = healthy
+        return {"type": "enforcement_monitor_status", "healthy": healthy,
+                "degraded": record.get("degraded"), "monitor_type": record.get("monitor_type"),
+                "session_id": record.get("session_id")}
 
     def _ensure_blocked(self, usb_id, expected):
         expected_address = (expected or {}).get("device_address")
@@ -393,17 +411,22 @@ class DeviceEnforcer:
     def handle(self, record):
         if not isinstance(record, dict) or record.get("schema_version") != SCHEMA_VERSION:
             return {"type": "enforcement_input_error", "message": "Expected policy schema_version 1"}
-        if record.get("type") != "policy_decision":
-            return None  # monitor status, skips, stream-closed: not ours to act on
+        kind = record.get("type")
+        if kind == "policy_monitor_status":
+            return self._monitor_status(record)
+        if kind != "policy_decision":
+            return None  # skips and stream-closed records: not ours to act on
         usb_id = record.get("usb_id")
         context = {"connection_id": record.get("connection_id"), "session_id": record.get("session_id")}
+        action = record.get("action")
         timestamp = record.get("decision_timestamp_ns")
-        if type(timestamp) is int:
-            age = self.clock() - timestamp
-            if not 0 <= age <= self.max_age_ns:
+        # An allow must prove it is fresh; one without a timestamp is refused (fail closed).
+        # A block without one is still acted on, since keeping a device blocked is safe.
+        if type(timestamp) is int or action == "allow":
+            fresh = type(timestamp) is int and 0 <= self.clock() - timestamp <= self.max_age_ns
+            if not fresh:
                 return {"type": "enforcement_skipped", "reason": "stale_decision",
                         "usb_id": usb_id, **context}
-        action = record.get("action")
         expected = record.get("device")
         try:
             if action == "allow":
@@ -422,6 +445,8 @@ class DeviceEnforcer:
         event_timestamp = record.get("event_timestamp_ns")
         if type(event_timestamp) is int:
             result["enforcement_latency_ns"] = self.clock() - event_timestamp
+        if record.get("reason") is not None:
+            result["policy_reason"] = record["reason"]  # why the policy decided, for the audit trail
         result.update(context)
         return result
 
@@ -429,15 +454,21 @@ class DeviceEnforcer:
 def reconcile(controller, bus_manager, policy_path, apply=True):
     """Evaluate devices already present on managed buses and authorise the allowed ones.
 
-    Non-allowed devices are reported but left blocked (not revoked), so existing input
-    devices and hubs are not cut off. This covers devices connected before the service.
+    Non-allowed devices are never revoked, so existing input devices and hubs are not cut
+    off. One that is still blocked is reported as ``block``; one that is already authorised
+    is reported as ``unchanged``, so a consumer cannot mistake it for a device that was blocked.
+    This covers devices connected before the service.
     """
     buses = bus_manager.discover()
     results = []
     for usb_id in controller.managed_device_ids(buses):
         try:
-            results.append(authorize_device(controller, usb_id, policy_path,
-                                             expected=None, apply=apply))
+            result = authorize_device(controller, usb_id, policy_path, expected=None, apply=apply)
+            device = result["device"]
+            if result["action"] == "block" and device and device.get("kernel_authorized"):
+                result.update(action="unchanged", policy_reason=result["reason"],
+                              reason="not_allowlisted_left_unchanged")
+            results.append(result)
         except DeviceError as error:
             results.append(_result("block", usb_id, None, applied=False, reason=error.code))
         except PolicyError as error:
@@ -447,28 +478,34 @@ def reconcile(controller, bus_manager, policy_path, apply=True):
             "buses": buses, "devices": results}
 
 
+def process_stream(enforcer, stream):
+    """Enforce each NDJSON line from ``stream``; always finish with an enforcement_stream_closed record."""
+    reason = "end_of_input"
+    try:
+        for line in stream:
+            if not line.strip():
+                continue
+            try:
+                record = enforcer.handle(_parse_json(line, "decision stream"))
+            except EnforcementError as error:
+                record = {"type": "enforcement_input_error", "message": str(error)}
+            if record is not None:
+                emit(record)
+    except KeyboardInterrupt:
+        reason = "requested_stop"  # Ctrl+C is a deliberate stop, not an error
+    emit({"type": "enforcement_stream_closed", "reason": reason})
+    return 0
+
+
 def enforce(controller, policy_path, apply=True):
     """Read policy decisions as NDJSON on stdin and enforce each one."""
     require_linux()
     if sys.stdin.isatty():
         raise EnforcementError("Pipe the policy watcher's JSON into enforce; see docs/STEP5-TESTING.md")
-    load_policy(policy_path)
+    policy = load_policy(policy_path)
     enforcer = DeviceEnforcer(controller, policy_path, apply=apply)
-    for line in sys.stdin:
-        if not line.strip():
-            continue
-        try:
-            record = enforcer.handle(_parse_json(line, "decision stream"))
-        except EnforcementError as error:
-            record = {"type": "enforcement_input_error", "message": str(error)}
-        if record is not None:
-            emit(record)
-    return 0
-
-
-def require_linux():
-    if sys.platform != "linux":
-        raise EnforcementError("Live USB authorisation runs inside the Ubuntu VM")
+    emit({"type": "enforcement_started", "apply": apply, "policy_revision": policy.revision})
+    return process_stream(enforcer, sys.stdin)
 
 
 def make_parser():
@@ -485,13 +522,15 @@ def make_parser():
     restore_parser = sub.add_parser("restore", help="Restore saved original defaults (dry run unless --apply)")
     restore_parser.add_argument("--apply", action="store_true", help="Actually write; otherwise dry run")
     sub.add_parser("status", help="Show current and recorded default-authorisation per bus")
-    authorize_parser = sub.add_parser("authorize", help="Re-validate one device and authorise it if allowed (dry run unless --apply)")
+    authorize_parser = sub.add_parser(
+        "authorize", help="Re-validate one device and authorise it if allowed (dry run unless --apply)")
     authorize_parser.add_argument("usb_id")
     authorize_parser.add_argument("--apply", action="store_true", help="Actually write; otherwise dry run")
     revoke_parser = sub.add_parser("revoke", help="Block one device (dry run unless --apply)")
     revoke_parser.add_argument("usb_id")
     revoke_parser.add_argument("--apply", action="store_true", help="Actually write; otherwise dry run")
-    reconcile_parser = sub.add_parser("reconcile", help="Evaluate devices already present on managed buses (dry run unless --apply)")
+    reconcile_parser = sub.add_parser(
+        "reconcile", help="Evaluate devices already present on managed buses (dry run unless --apply)")
     reconcile_parser.add_argument("--apply", action="store_true", help="Actually write; otherwise dry run")
     enforce_parser = sub.add_parser("enforce", help="Read policy decisions on stdin and enforce them")
     enforce_parser.add_argument("--dry-run", action="store_true", help="Decide and report without writing")
@@ -502,15 +541,17 @@ def main(argv=None):
     """Dispatch one CLI command and emit its JSON result; return a process exit code."""
     args = make_parser().parse_args(argv)
     try:
-        config = load_config(args.config)
-        manager = BusManager(config, root=args.usb_root)
+        if args.command in ("arm", "restore", "status", "reconcile"):
+            # Only the bus-level commands need the enforcement config.
+            config = load_config(args.config)
+            manager = BusManager(config, root=args.usb_root)
         if args.command == "arm":
             emit(arm(manager, config.state_file, apply=args.apply))
         elif args.command == "restore":
             emit(restore(manager, config.state_file, apply=args.apply))
         elif args.command == "status":
             emit(status(manager, config.state_file))
-        elif args.command in ("authorize", "revoke", "reconcile", "enforce"):
+        else:
             require_linux()
             controller = DeviceController(root=args.usb_root)
             if args.command == "authorize":
@@ -525,7 +566,7 @@ def main(argv=None):
     except BrokenPipeError:
         sys.stdout = open(os.devnull, "w")
         return 1
-    except EnforcementError as error:
+    except (EnforcementError, PolicyError, DeviceError, ValueError, OSError) as error:
         emit({"type": "enforcement_error", "message": str(error)})
         print(str(error), file=sys.stderr)
         return 2
