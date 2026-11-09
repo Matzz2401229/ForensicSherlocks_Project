@@ -182,7 +182,7 @@ sudo python3 src/monitor/usb_monitor.py |
   sudo python3 src/enforcement/usb_authorization.py --policy config/allowlist.example.json enforce
 ```
 
-Wait for an `enforcement_monitor_status` record with `healthy: true`, then connect the device. Each device produces an `enforcement_result` with `action` (`allow` or `block`), `enforcement_applied`, the policy's `policy_reason`, and `enforcement_latency_ns`. Press **Ctrl+C** to stop; the stage ends with an `enforcement_stream_closed` record.
+`enforce` acts only on the buses in `config/enforcement.json`; its first record lists them and warns about any that are not armed. Wait for an `enforcement_monitor_status` record with `healthy: true`, then connect the device. Each device produces an `enforcement_result` with `action` (`allow` or `block`), `enforcement_applied`, the policy's `policy_reason`, and `enforcement_latency_ns`. Decisions that cannot be tied safely to the device now on the port, or that target an unmanaged bus, are reported as `enforcement_skipped` and change nothing; a failed sysfs write is reported as `enforcement_error`. Press **Ctrl+C** to stop; the stage ends with an `enforcement_stream_closed` record. Its exit status is non-zero if the upstream pipeline ended unexpectedly or any write failed.
 
 To handle devices that were already connected before the pipeline started:
 
@@ -300,7 +300,7 @@ python3 -m unittest discover -s tests -p 'test_*.py' -v
 
 At completion of step 4, all **58 tests** passed in the Ubuntu VM. Live tests also verified USB reconnection monitoring, connection correlation, allowlist matches and mismatches, identification while unauthorised, and normal backend cleanup.
 
-Step 5 brings the suite to **102 tests**; the access-control tests use a simulated sysfs tree and need no root or USB device. Live tests in the Ubuntu VM verified that default-deny keeps a newly connected drive blocked, that authorise and revoke change real device access, that the pipeline authorises an allowlisted drive automatically while an unlisted drive stays blocked, that reconcile authorises an allowed drive connected beforehand without revoking the VMware virtual mouse or hubs, and that restore returns every bus to its original setting.
+Step 5 brings the suite to **123 tests**, including regression checks for the issues found in code review (device replacement during authorisation, uncorrelated block decisions, managed-bus scope, exit status, and write-failure reporting). The access-control tests use a simulated sysfs tree and need no root or USB device; four of them need POSIX file behaviour and are skipped on Windows. Live tests in the Ubuntu VM verified that default-deny keeps a newly connected drive blocked, that authorise and revoke change real device access, that the pipeline authorises an allowlisted drive automatically while an unlisted drive stays blocked, that reconcile authorises an allowed drive connected beforehand without revoking the VMware virtual mouse or hubs, and that restore returns every bus to its original setting.
 
 See [step 3 testing](docs/STEP3-TESTING.md), [step 4 testing](docs/STEP4-TESTING.md), and [step 5 testing](docs/STEP5-TESTING.md) for detailed procedures. Treat device IDs in those guides as examples and rediscover the current topology before testing.
 
@@ -322,7 +322,7 @@ See [step 3 testing](docs/STEP3-TESTING.md), [step 4 testing](docs/STEP4-TESTING
 
 - USB authorisation is integrated with policy decisions and controls whole devices. It does not restrict individual interfaces of a composite device (for example, a device that also presents a keyboard); that is left to the supplementary BPF-LSM layer.
 - Default-deny affects devices connected after `arm`. Devices already connected keep their access; `reconcile` authorises allowed ones but does not revoke the others.
-- Before authorising, the enforcement stage re-reads the device and re-checks the policy. This narrows, but cannot close, the window in which a different device could replace the approved one.
+- Before authorising, the enforcement stage binds to the device instance, re-reads it and re-checks the policy, and writes only to that instance; a device that replaces it at the same port is never authorised. This relies on Linux refusing writes to a removed device's sysfs files (checked in [step 5 testing](docs/STEP5-TESTING.md)). It does not stop a device that copies an allowlisted identity.
 - BPF-LSM feasibility testing restricted new opens of one designated USB test file. It does not establish whole-volume, raw-device, or all-interface enforcement.
 - Vendor/product IDs and serial numbers are device-reported attributes and can be spoofed. A policy match does not authenticate physical identity.
 - The watcher processes new setup events; `reconcile` handles devices connected before startup and must currently be run by hand. Running it automatically on service start and after recovery remains planned.
