@@ -4,6 +4,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
+#include <linux/errno.h>
 
 /* Identity of the file we want to restrict. */
 struct target_identity {
@@ -72,7 +73,7 @@ int BPF_PROG(restrict_file_open,
     if (dev_major == target->major &&
         dev_minor == target->minor &&
         inode_number == target->inode) {
-        return -13; /* -EACCES: Permission denied */
+        return -EACCES; /* -EACCES: Permission denied */
     }
 
     return 0;
