@@ -18,3 +18,7 @@ __pycache__/
 # copy docs/ by hand if the repo is ever moved or re-cloned.
 /docs/dev-log.md
 /docs/DEVELOPMENT-JOURNAL.md
+
+# Generated BPF-LSM build artefacts
+/src/enforcement/bpf/build/lsm_guard.bpf.o
+/src/enforcement/bpf/build/lsm_controller
