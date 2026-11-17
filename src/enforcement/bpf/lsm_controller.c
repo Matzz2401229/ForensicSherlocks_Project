@@ -167,9 +167,11 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    /* Insert the target identity into the BPF map. */
-    if (bpf_map_update_elem(map_fd, &(uint32_t){0},
-                            &identity, BPF_ANY) != 0) {
+    /* Insert the target identity into the BPF hash map. */
+    __u8 target_value = 1;
+
+    if (bpf_map_update_elem(map_fd, &identity,
+                            &target_value, BPF_ANY) != 0) {
         perror("Failed to update BPF target map");
         lsm_guard_bpf__destroy(skel);
         return EXIT_FAILURE;

@@ -6,19 +6,22 @@
 #include <bpf/bpf_core_read.h>
 #include <linux/errno.h>
 
-/* Identity of the file we want to restrict. */
+/* Identity of a file to restrict. */
 struct target_identity {
     __u32 major;
     __u32 minor;
     __u64 inode;
 };
 
-/* A single-entry map containing the target identity. */
+/*
+ * Hash map containing multiple protected file identities.
+ * Each identity is a key; value 1 indicates an active target.
+ */
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, struct target_identity);
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, struct target_identity);
+    __type(value, __u8);
 } target_map SEC(".maps");
 
 /* BPF-LSM hook: called when a file is opened. */
@@ -29,13 +32,10 @@ int BPF_PROG(restrict_file_open,
 {
     struct inode *inode;
     struct super_block *sb;
-    struct target_identity *target;
+    struct target_identity identity = {};
+    __u8 *target;
 
-    __u32 key = 0;
     __u32 dev;
-    __u32 dev_major;
-    __u32 dev_minor;
-    __u64 inode_number;
 
     /* Preserve a denial made by an earlier LSM. */
     if (ret != 0)
@@ -56,25 +56,18 @@ int BPF_PROG(restrict_file_open,
     if (!sb)
         return 0;
 
-    inode_number = BPF_CORE_READ(inode, i_ino);
+    identity.inode = BPF_CORE_READ(inode, i_ino);
     dev = (__u32)BPF_CORE_READ(sb, s_dev);
 
     /* Decode the kernel device number. */
-    dev_major = dev >> 20;
-    dev_minor = dev & 0xFFFFF;
+    identity.major = dev >> 20;
+    identity.minor = dev & 0xFFFFF;
 
-    /* Retrieve the configured target identity. */
-    target = bpf_map_lookup_elem(&target_map, &key);
+    /* Check whether this exact file is registered. */
+    target = bpf_map_lookup_elem(&target_map, &identity);
 
-    if (!target)
-        return 0;
-
-    /* Deny access only when all three identifiers match. */
-    if (dev_major == target->major &&
-        dev_minor == target->minor &&
-        inode_number == target->inode) {
-        return -EACCES; /* -EACCES: Permission denied */
-    }
+    if (target)
+        return -EACCES;
 
     return 0;
 }
