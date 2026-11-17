@@ -53,8 +53,34 @@ Install the development dependencies in Ubuntu:
 
 ```bash
 sudo apt update
-sudo apt install -y git python3 bpftrace clang llvm build-essential libbpf-dev libelf-dev pkg-config
+sudo apt install -y git python3 bpftrace clang llvm bpftool build-essential libbpf-dev libelf-dev pkg-config
 ```
+
+### Build the supplementary BPF-LSM enforcement component
+
+The BPF-LSM component has a separate build script. Run it from the repository root:
+
+```bash
+./src/enforcement/bpf/build.sh
+```
+
+The script performs the following steps:
+
+1. Compiles `lsm_guard.bpf.c` into `build/lsm_guard.bpf.o`.
+2. Generates the libbpf skeleton `build/lsm_guard.skel.h` using `bpftool`.
+3. Compiles `lsm_controller.c` into `build/lsm_controller`.
+
+The build requires Clang, GCC, bpftool, pkg-config, libbpf development files, and kernel BTF at `/sys/kernel/btf/vmlinux`. The existing `build/vmlinux.h` header is used during compilation.
+
+A successful build does not activate enforcement. To test the controller, first prepare a suitable loopback-backed test file and then run:
+
+```bash
+sudo ./src/enforcement/bpf/build/lsm_controller --test-loopback /mnt/portwatchman-test/restricted.txt
+```
+
+This test mode verifies file-open enforcement against a file on a loopback device. It does not demonstrate physical USB enforcement. Press `Ctrl+C` to stop the controller and detach the BPF-LSM program.
+
+The generated BPF object and controller executable are local build artefacts and are excluded from Git. The generated skeleton is retained in the repository.
 
 ## Run the project
 
