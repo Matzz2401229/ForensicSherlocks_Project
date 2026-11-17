@@ -55,6 +55,35 @@ done
 
 [[ -f "${NORMAL_FILE}" ]] ||
     fail "Normal test file is missing."
+    
+# Test rejection of invalid controller targets.
+echo
+echo "[1/4] Testing invalid target rejection..."
+
+# Missing file must be rejected.
+if "${CONTROLLER}" --test-loopback \
+    "/tmp/portwatchman-missing-test-file" \
+    >/dev/null 2>&1; then
+    fail "Controller accepted a missing target file."
+fi
+
+echo "PASS: Missing target file was rejected."
+
+# Directory must be rejected.
+if "${CONTROLLER}" --test-loopback \
+    "/tmp" >/dev/null 2>&1; then
+    fail "Controller accepted a directory as the target."
+fi
+
+echo "PASS: Directory target was rejected."
+
+# Non-loopback file must be rejected.
+if "${CONTROLLER}" --test-loopback \
+    "/etc/hostname" >/dev/null 2>&1; then
+    fail "Controller accepted a non-loopback target."
+fi
+
+echo "PASS: Non-loopback target was rejected."
 
 # Confirm that the target filesystem is loopback-backed.
 SOURCE="$(findmnt -n -o SOURCE --target "${RESTRICTED_FILE}" || true)"
