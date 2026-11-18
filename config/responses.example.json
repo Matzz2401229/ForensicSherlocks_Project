@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "trigger": {
+    "include_skipped": false
+  },
+  "cooldown_seconds": 30,
+  "allowed_roots": [
+    "/home/student/portwatchman-demo"
+  ],
+  "actions": [
+    {
+      "type": "lock_session"
+    },
+    {
+      "type": "delete",
+      "paths": [
+        "/home/student/portwatchman-demo/sensitive"
+      ],
+      "passes": 1
+    },
+    {
+      "type": "sanitise",
+      "home_dirs": [
+        "/home/student"
+      ],
+      "items": [
+        "recent_files",
+        "thumbnails",
+        "shell_history",
+        "trash",
+        "drop_caches"
+      ],
+      "passes": 1
+    },
+    {
+      "type": "power",
+      "mode": "poweroff",
+      "method": "force"
+    }
+  ]
+}

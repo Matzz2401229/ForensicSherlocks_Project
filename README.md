@@ -4,7 +4,7 @@ PortWatchman is a Linux USB monitoring, allowlisting, and enforcement project de
 
 The intended behaviour is to keep newly connected USB devices blocked until their reported attributes satisfy the allowlist. Unapproved devices remain blocked and can trigger a configured response, such as session locking or shutdown.
 
-**Current implementation:** USB monitoring, device identification/allowlist decisions, and USB access control are implemented and tested. Access control sets default-deny on managed USB buses, authorises allowed devices after re-validating them, keeps unapproved devices blocked, and reconciles devices connected before it started. The integrated BPF-LSM layer, response actions, and the running service are still planned. The policy watcher on its own still reports `enforcement_applied: false`; device access changes only when its decisions are piped into the enforcement stage.
+**Current implementation:** USB monitoring, device identification/allowlist decisions, USB access control, and configurable responses are implemented and tested. Access control sets default-deny on managed USB buses, authorises allowed devices after re-validating them, keeps unapproved devices blocked, and reconciles devices connected before it started. The response stage runs a configured, ordered set of actions (session lock, secure deletion, trace sanitisation, power-off or reboot) when a device is blocked. The integrated BPF-LSM layer and the running service are still planned. The policy watcher on its own still reports `enforcement_applied: false`; device access changes only when its decisions are piped into the enforcement stage.
 
 ## Architecture
 
@@ -30,6 +30,7 @@ The currently implemented pipeline is:
 ```text
 USB event -> eBPF monitor -> JSON event -> device identification -> allow/block decision
   -> re-validation -> USB authorisation (authorise or keep blocked)
+  -> on block: configured responses (lock / delete / sanitise / power)
 ```
 
 ## Development environment
@@ -46,6 +47,8 @@ Development and live testing currently target one Ubuntu VM configuration:
 | Python | Python 3.10 or later; standard library only for current components |
 
 The kernel must support eBPF and expose BTF at `/sys/kernel/btf/vmlinux`. The supplementary BPF-LSM work also requires `bpf` in the active LSM list. Live monitoring requires root privileges.
+
+For a step-by-step build of this VM (downloads, VM settings, kernel and BPF-LSM checks), see [docs/SETUP.md](docs/SETUP.md).
 
 This environment has been validated for the prototype. Compatibility with other kernels, distributions, and physical machines remains subject to testing. Enforcement inside the VM applies to devices connected to the Ubuntu guest.
 
@@ -199,6 +202,35 @@ sudo python3 src/enforcement/usb_authorization.py revoke 2-1 --apply
 
 Find the USB ID with `device_policy.py list` first. See [step 5 testing](docs/STEP5-TESTING.md) for the full procedure.
 
+### Configurable responses
+
+The response stage reads the enforcement stage's output and, for each blocked device, runs the actions in `config/responses.json` in order. Every command is a dry run unless you add `--apply`, which needs `sudo`. Take a VM snapshot before applying deletion, sanitisation, or power actions.
+
+Check the configuration and preview the whole plan without changing anything:
+
+```bash
+python3 src/responses/responses.py validate
+python3 src/responses/responses.py trigger
+```
+
+Test one action at a time (the default config only locks the session):
+
+```bash
+sudo python3 src/responses/responses.py run-action lock_session --apply
+```
+
+Add the stage to the end of the pipeline:
+
+```bash
+sudo -v
+sudo python3 src/monitor/usb_monitor.py |
+  python3 src/policy/device_policy.py --policy config/allowlist.example.json watch |
+  sudo python3 src/enforcement/usb_authorization.py --policy config/allowlist.example.json enforce |
+  sudo python3 src/responses/responses.py watch --apply
+```
+
+Each blocked device produces `response_triggered`, one `response_action` per action (with `duration_ns` and `since_trigger_ns`), and `response_completed`. Repeat triggers inside the cooldown produce `response_suppressed`. See [step 7 testing](docs/STEP7-TESTING.md) for the full procedure, including a raw-disk check that compares secure deletion with `rm`.
+
 ## Allowlist configuration
 
 The default policy is `config/allowlist.json`:
@@ -245,6 +277,35 @@ The global `--policy` option goes **before** the command. The watcher reloads th
 
 `"auto"` manages every USB bus. This is the default because the same device can enumerate on a different controller across reconnects, which would bypass default-deny on an unmanaged bus. To manage specific buses, list them, for example `["usb2", "usb3"]` (see `config/enforcement.example.json`). The original `authorized_default` values are saved before any bus is changed, so `restore` returns the true originals even if `arm` runs more than once.
 
+## Responses configuration
+
+`config/responses.json` is the default and only locks the session. `config/responses.example.json` shows every action:
+
+```json
+{
+  "schema_version": 1,
+  "trigger": { "include_skipped": false },
+  "cooldown_seconds": 30,
+  "allowed_roots": ["/home/student/portwatchman-demo"],
+  "actions": [
+    { "type": "lock_session" },
+    { "type": "delete", "paths": ["/home/student/portwatchman-demo/sensitive"], "passes": 1 },
+    { "type": "sanitise", "home_dirs": ["/home/student"],
+      "items": ["recent_files", "thumbnails", "shell_history", "trash", "drop_caches"] },
+    { "type": "power", "mode": "poweroff", "method": "force" }
+  ]
+}
+```
+
+| Action | Options |
+| --- | --- |
+| `lock_session` | none; runs `loginctl lock-sessions` |
+| `delete` | `paths` inside `allowed_roots`; `passes` 1 to 7 (default 1) |
+| `sanitise` | `home_dirs`; `items` from `recent_files`, `thumbnails`, `shell_history`, `trash`, `drop_caches`; `passes` |
+| `power` | `mode` `poweroff` or `reboot`; `method` `graceful`, `force`, or `immediate` (sysrq after `sync`) |
+
+Actions run in the listed order, each type at most once, and `power` must be last. Deletion roots must be absolute, at least two levels deep, and outside system directories; paths are re-checked with symlinks resolved before deletion, and symlinks are removed rather than followed. Copy the example to `config/responses.local.json` (ignored by Git) and pass it with `--config`; the global `--config` option goes **before** the command.
+
 ## Directory structure
 
 Current repository layout:
@@ -258,23 +319,30 @@ portwatchman/
 │   ├── allowlist.json               # Default policy: block, no rules
 │   ├── allowlist.example.json       # Example lab-device rule
 │   ├── enforcement.json             # Access control: managed buses ("auto"), state file
-│   └── enforcement.example.json     # Example with explicit bus list
+│   ├── enforcement.example.json     # Example with explicit bus list
+│   ├── responses.json               # Default responses: lock the session only
+│   └── responses.example.json       # Example with every response action
 ├── src/
 │   ├── monitor/
 │   │   ├── usb_events.bt           # eBPF probe definitions
 │   │   └── usb_monitor.py          # Monitor supervision and JSON output
 │   ├── policy/
 │   │   └── device_policy.py        # Identification, policy rules, and CLI
-│   └── enforcement/
-│       └── usb_authorization.py    # Default-deny, authorise/revoke, enforce, reconcile
+│   ├── enforcement/
+│   │   └── usb_authorization.py    # Default-deny, authorise/revoke, enforce, reconcile
+│   └── responses/
+│       └── responses.py            # Lock, secure delete, sanitise, power; response stage
 ├── tests/
 │   ├── test_usb_monitor.py
 │   ├── test_device_policy.py
-│   └── test_usb_authorization.py
+│   ├── test_usb_authorization.py
+│   └── test_responses.py
 ├── docs/
+│   ├── SETUP.md                    # Building the Ubuntu VM
 │   ├── STEP3-TESTING.md
 │   ├── STEP4-TESTING.md
-│   └── STEP5-TESTING.md
+│   ├── STEP5-TESTING.md
+│   └── STEP7-TESTING.md
 ├── logs/                           # Local output; created as needed, ignored
 └── build/                          # Local build/test files; ignored
 ```
@@ -284,10 +352,9 @@ Planned additions — these paths are placeholders and may change during impleme
 ```text
 src/
 ├── enforcement/                    # Supplementary BPF-LSM component (alongside usb_authorization.py)
-├── responses/                      # Configurable response actions
 └── daemon/                         # Application lifecycle and integration
 config/
-└── <response-and-service-config>   # Format and filename to be decided
+└── <service-config>                # Format and filename to be decided
 ```
 
 ## Testing
@@ -302,7 +369,9 @@ At completion of step 4, all **58 tests** passed in the Ubuntu VM. Live tests al
 
 Step 5 brings the suite to **130 tests**, including regression checks for the issues found in code review (device replacement during authorisation, uncorrelated block decisions, managed-bus scope, exit status, and write-failure reporting). These include degraded monitoring followed by a deliberate stop and underlying write/cleanup failures. The access-control tests use a simulated sysfs tree and need no root or USB device; four of them need POSIX file behaviour and are skipped on Windows. Live tests in the Ubuntu VM verified that default-deny keeps a newly connected drive blocked, that authorise and revoke change real device access, that the pipeline authorises an allowlisted drive automatically while an unlisted drive stays blocked, that reconcile authorises an allowed drive connected beforehand without revoking the VMware virtual mouse or hubs, and that restore returns every bus to its original setting.
 
-See [step 3 testing](docs/STEP3-TESTING.md), [step 4 testing](docs/STEP4-TESTING.md), and [step 5 testing](docs/STEP5-TESTING.md) for detailed procedures. Treat device IDs in those guides as examples and rediscover the current topology before testing.
+Step 7 adds 46 tests for configurable responses, bringing the suite to **176 tests**. They cover config validation (unsafe or system roots, ordering, unknown fields), secure deletion (every byte overwritten on every pass, symlinks removed rather than followed, symlinked parents that escape the root refused, FIFOs unlinked without being opened, per-file failures reported), each action in dry-run and applied form, cooldown and post-power suppression, and stream exit status. They use temporary files, a fake `/proc` and a fake command runner, so they never lock, power off, or delete outside the fixture.
+
+See [step 3 testing](docs/STEP3-TESTING.md), [step 4 testing](docs/STEP4-TESTING.md), [step 5 testing](docs/STEP5-TESTING.md), and [step 7 testing](docs/STEP7-TESTING.md) for detailed procedures. Treat device IDs in those guides as examples and rediscover the current topology before testing.
 
 ## Implementation progress
 
@@ -312,7 +381,7 @@ See [step 3 testing](docs/STEP3-TESTING.md), [step 4 testing](docs/STEP4-TESTING
 - [x] 4. Implement device identification and allowlisting.
 - [x] 5. Implement automatic USB access control.
 - [ ] 6. Implement supplementary BPF-LSM enforcement.
-- [ ] 7. Implement configurable responses.
+- [x] 7. Implement configurable responses.
 - [ ] 8. Integrate components into a running service.
 - [ ] 9. Handle failures, recovery, and edge cases.
 - [ ] 10. Test and evaluate the complete solution.
@@ -327,5 +396,5 @@ See [step 3 testing](docs/STEP3-TESTING.md), [step 4 testing](docs/STEP4-TESTING
 - Vendor/product IDs and serial numbers are device-reported attributes and can be spoofed. A policy match does not authenticate physical identity.
 - The watcher processes new setup events; `reconcile` handles devices connected before startup and must currently be run by hand. Running it automatically on service start and after recovery remains planned.
 - Current JSON output supports development testing; durable audit logging and service supervision remain planned.
-- Session locking, shutdown/reboot, secure deletion, and data sanitisation are not implemented. Secure deletion and sanitisation require further feasibility work; reliable evidence erasure is not an established project capability.
+- Secure deletion overwrites a file's current blocks in place. It does not reach older copies held by journaling in `data=journal` mode, copy-on-write file systems, SSD wear levelling, swap, backups, VMware snapshots, or the virtual disk on the host, so it is not a guarantee of evidence erasure. Sanitisation covers only the listed traces, and `drop_caches` does not wipe RAM. See [step 7 testing](docs/STEP7-TESTING.md).
 - Timing measurements inside VMware describe guest behaviour. They do not establish physical insertion latency or erase data retained by the Windows host or VM snapshots.

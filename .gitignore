@@ -18,3 +18,5 @@ __pycache__/
 # copy docs/ by hand if the repo is ever moved or re-cloned.
 /docs/dev-log.md
 /docs/DEVELOPMENT-JOURNAL.md
+# Personal response configs (machine-specific paths)
+/config/*.local.json
