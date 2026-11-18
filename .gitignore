@@ -3,6 +3,7 @@
 *.o
 *.a
 *.so
+/src/enforcement/bpf/build
 
 # Runtime output
 /logs/
