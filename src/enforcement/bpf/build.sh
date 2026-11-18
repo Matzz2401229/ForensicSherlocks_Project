@@ -28,6 +28,12 @@ if ! pkg-config --exists libbpf; then
     exit 1
 fi
 
+# Check json-c development files.
+if ! pkg-config --exists json-c; then
+    echo "ERROR: json-c development package not found." >&2
+    exit 1
+fi
+
 # Check kernel BTF and project headers.
 if [[ ! -r /sys/kernel/btf/vmlinux ]]; then
     echo "ERROR: Kernel BTF is unavailable." >&2
@@ -84,7 +90,7 @@ echo "[3/3] Compiling userspace controller..."
 gcc -Wall -Wextra -O2 \
     "$CONTROLLER_SOURCE" \
     -o "${CONTROLLER}.tmp" \
-    $(pkg-config --cflags --libs libbpf)
+    $(pkg-config --cflags --libs libbpf json-c)
 
 mv "${CONTROLLER}.tmp" "$CONTROLLER"
 
