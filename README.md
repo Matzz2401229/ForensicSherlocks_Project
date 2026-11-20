@@ -4,7 +4,7 @@ PortWatchman is a Linux USB monitoring, allowlisting, and enforcement project de
 
 The intended behaviour is to keep newly connected USB devices blocked until their reported attributes satisfy the allowlist. Unapproved devices remain blocked and can trigger a configured response, such as session locking or shutdown.
 
-**Current implementation:** USB monitoring, device identification/allowlist decisions, and USB access control are implemented and tested. Access control sets default-deny on managed USB buses, authorises allowed devices after re-validating them, keeps unapproved devices blocked, and reconciles devices connected before it started. The integrated BPF-LSM layer, response actions, and the running service are still planned. The policy watcher on its own still reports `enforcement_applied: false`; device access changes only when its decisions are piped into the enforcement stage.
+**Current implementation:** USB monitoring, device identification/allowlist decisions, and USB access control are implemented and tested. Access control sets default-deny on managed USB buses, authorises allowed devices after re-validating them, keeps unapproved devices blocked, and reconciles devices connected before it started. A selected-file BPF-LSM component is provided for step 6 acceptance testing; a root-only Unix socket and opt-in Python selected-file bridge are included, pending Ubuntu acceptance. Service orchestration and response actions remain planned. The policy watcher on its own still reports `enforcement_applied: false`; device access changes only when its decisions are piped into the enforcement stage.
 
 ## Architecture
 
@@ -30,6 +30,7 @@ The currently implemented pipeline is:
 ```text
 USB event -> eBPF monitor -> JSON event -> device identification -> allow/block decision
   -> re-validation -> USB authorisation (authorise or keep blocked)
+  -> optional BPF-LSM bridge -> selected-file registration after mount
 ```
 
 ## Development environment
@@ -53,34 +54,40 @@ Install the development dependencies in Ubuntu:
 
 ```bash
 sudo apt update
-sudo apt install -y git python3 bpftrace clang llvm bpftool build-essential libbpf-dev libelf-dev pkg-config
+sudo apt install -y git python3 bpftrace clang llvm bpftool build-essential libbpf-dev libelf-dev libjson-c-dev pkg-config
 ```
 
-### Build the supplementary BPF-LSM enforcement component
+### Build and test the supplementary BPF-LSM guard
 
-The BPF-LSM component has a separate build script. Run it from the repository root:
+Step 6 adds a guard for new opens of selected regular file identities on verified
+USB-backed filesystems. It includes a foreground C/libbpf controller, root-only
+Unix socket (ADD/REMOVE/LIST/STATUS/STOP), denial counters, target-lifetime checks,
+an opt-in Python bridge tied to USB connection IDs, and an explicit loopback test mode.
+Building requires Clang, GCC, bpftool, pkg-config, libbpf-dev, libelf-dev and
+libjson-c-dev. Generated headers, skeletons and binaries stay in the ignored build
+directory and are regenerated locally.
 
 ```bash
-./src/enforcement/bpf/build.sh
+bash src/enforcement/bpf/build.sh
+sudo src/enforcement/bpf/build/lsm_controller --check
+python3 -m unittest discover -s tests -p 'test_*.py' -v
+sudo python3 tests/enforcement/test_bpf_lsm.py --loopback
 ```
 
-The script performs the following steps:
-
-1. Compiles `lsm_guard.bpf.c` into `build/lsm_guard.bpf.o`.
-2. Generates the libbpf skeleton `build/lsm_guard.skel.h` using `bpftool`.
-3. Compiles `lsm_controller.c` into `build/lsm_controller`.
-
-The build requires Clang, GCC, bpftool, pkg-config, libbpf development files, and kernel BTF at `/sys/kernel/btf/vmlinux`. The existing `build/vmlinux.h` header is used during compilation.
-
-A successful build does not activate enforcement. To test the controller, first prepare a suitable loopback-backed test file and then run:
+For physical USB acceptance, first authorise/mount the intended test drive, verify
+its actual mount path, and use:
 
 ```bash
-sudo ./src/enforcement/bpf/build/lsm_controller --test-loopback /mnt/portwatchman-test/restricted.txt
+sudo python3 tests/enforcement/test_bpf_lsm.py --usb '/media/ryelle/ACTUAL_VOLUME'
 ```
 
-This test mode verifies file-open enforcement against a file on a loopback device. It does not demonstrate physical USB enforcement. Press `Ctrl+C` to stop the controller and detach the BPF-LSM program.
-
-The generated BPF object and controller executable are local build artefacts and are excluded from Git. The generated skeleton is retained in the repository.
+The placeholder must be replaced. The runner creates and removes an owned fixture
+directory; it does not select pre-existing user files. See
+[step 6 testing](docs/STEP6-TESTING.md) for manual tests, controls, and scope.
+Step 6 remains pending target-VM build and acceptance results. A successful Python
+suite alone does not validate the kernel program. The guard follows file identity,
+not replacement pathnames; it does not cover existing data descriptors, raw devices,
+mount operations, mmap, HID interfaces, or every hotplug race.
 
 ## Run the project
 
@@ -292,15 +299,21 @@ portwatchman/
 │   ├── policy/
 │   │   └── device_policy.py        # Identification, policy rules, and CLI
 │   └── enforcement/
-│       └── usb_authorization.py    # Default-deny, authorise/revoke, enforce, reconcile
+│       ├── usb_authorization.py    # Default-deny, authorise/revoke, enforce, reconcile
+│       ├── lsm_client.py           # Root Unix socket client
+│       ├── lsm_bridge.py           # Opt-in policy/connection-to-target bridge
+│       └── bpf/                    # Step 6 guard, target resolver, socket controller and build script
 ├── tests/
 │   ├── test_usb_monitor.py
 │   ├── test_device_policy.py
-│   └── test_usb_authorization.py
+│   ├── test_usb_authorization.py
+│   ├── test_lsm_controller.py       # Native CLI safety tests after Linux build
+│   └── enforcement/                # Root-only BPF acceptance runner
 ├── docs/
 │   ├── STEP3-TESTING.md
 │   ├── STEP4-TESTING.md
-│   └── STEP5-TESTING.md
+│   ├── STEP5-TESTING.md
+│   └── STEP6-TESTING.md
 ├── logs/                           # Local output; created as needed, ignored
 └── build/                          # Local build/test files; ignored
 ```
@@ -328,6 +341,8 @@ At completion of step 4, all **58 tests** passed in the Ubuntu VM. Live tests al
 
 Step 5 brings the suite to **130 tests**, including regression checks for the issues found in code review (device replacement during authorisation, uncorrelated block decisions, managed-bus scope, exit status, and write-failure reporting). These include degraded monitoring followed by a deliberate stop and underlying write/cleanup failures. The access-control tests use a simulated sysfs tree and need no root or USB device; four of them need POSIX file behaviour and are skipped on Windows. Live tests in the Ubuntu VM verified that default-deny keeps a newly connected drive blocked, that authorise and revoke change real device access, that the pipeline authorises an allowlisted drive automatically while an unlisted drive stays blocked, that reconcile authorises an allowed drive connected beforehand without revoking the VMware virtual mouse or hubs, and that restore returns every bus to its original setting.
 
+Step 6 adds native CLI safety tests and Python socket/bridge tests. Native tests require a compiled Linux controller; the separate root-only runner exercises kernel enforcement and socket authentication. The bridge is disabled unless `enforce --lsm-config FILE` is supplied; registration failure handling is an explicit configuration choice. See [step 6 testing](docs/STEP6-TESTING.md) for staged verification and the post-authorisation registration window.
+
 See [step 3 testing](docs/STEP3-TESTING.md), [step 4 testing](docs/STEP4-TESTING.md), and [step 5 testing](docs/STEP5-TESTING.md) for detailed procedures. Treat device IDs in those guides as examples and rediscover the current topology before testing.
 
 ## Implementation progress
@@ -346,7 +361,7 @@ See [step 3 testing](docs/STEP3-TESTING.md), [step 4 testing](docs/STEP4-TESTING
 
 ## Scope and limitations
 
-- USB authorisation is integrated with policy decisions and controls whole devices. It does not restrict individual interfaces of a composite device (for example, a device that also presents a keyboard); that is left to the supplementary BPF-LSM layer.
+- USB authorisation is integrated with policy decisions and controls whole devices. Per-interface controls are not implemented. The step 6 file-open guard does not control HID traffic or provide a general composite-device firewall.
 - Default-deny affects devices connected after `arm`. Devices already connected keep their access; `reconcile` authorises allowed ones but does not revoke the others.
 - Before authorising, the enforcement stage binds to the device instance, re-reads it and re-checks the policy, and writes only to that instance; a device that replaces it at the same port is never authorised. This relies on Linux refusing writes to a removed device's sysfs files (checked in [step 5 testing](docs/STEP5-TESTING.md)). It does not stop a device that copies an allowlisted identity.
 - BPF-LSM feasibility testing restricted new opens of one designated USB test file. It does not establish whole-volume, raw-device, or all-interface enforcement.
