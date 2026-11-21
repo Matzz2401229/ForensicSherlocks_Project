@@ -1,18 +1,19 @@
 # Step 6: selected-file BPF-LSM enforcement
 
-Status: the original revision passed Ubuntu compilation, all 173 tests, loopback
-and physical USB acceptance, manual socket controls, live bridge registration,
-serial-mismatch rejection and clean shutdown. Safe unmount testing exposed held
-O_PATH references keeping the mount busy. This revision adds coordinated removal;
-its Ubuntu rebuild, loopback regression and live reconnect/failure checks are pending.
-Windows test results do not establish successful BPF attachment.
+Status: complete for the selected-file prototype scope in the recorded Ubuntu VM
+environment. Verification includes the 181-test suite, native build/preflight,
+loopback and physical USB enforcement, socket authentication, automatic bridge
+registration, rejection, normal cleanup, coordinated removal/reconnect and deliberate
+controller-loss reporting. Live failure handling was tested with `on_error: report`;
+automatic deauthorisation on failure has unit coverage but has not been live-tested.
+Rerun the procedures for another environment; Windows checks do not prove attachment.
 
 ## Roadmap and current scope
 
-| Groupmate's stage | Implementation supplied | Required verification |
+| Development stage | Implementation supplied | Verified behaviour |
 | --- | --- | --- |
 | 1. Target management | Inspection, held file/device references, bounded registry, map synchronisation | Linux build and multiple-file tests |
-| 2. Commands | ADD, REMOVE, LIST, STATUS, STOP; correlated JSON replies | Socket acceptance tests |
+| 2. Commands | ADD, REMOVE, LIST, STATUS, PREPARE_REMOVE, STOP; correlated replies | Socket acceptance tests |
 | 3. Unix socket | `/run/portwatchman/lsm_controller.sock`, root `SO_PEERCRED`, 0700 directory/0600 socket, bounded input, deadlines and shutdown | Permission and peer-credential tests |
 | 4. Tests | Existing stdin/loopback regressions retained; socket and Python bridge tests added | Run suite and root acceptance runner |
 | 5. Python integration | Optional bridge, configured paths, connection ownership, disconnect cleanup and explicit error behaviour | VM end-to-end allow/block/registration/removal tests |
@@ -38,24 +39,17 @@ Device-reported IDs can be spoofed. Periodic checks are best effort, not a guara
 against every forced-unmount/device-number-reuse race. Counters are in-memory
 snapshots, not durable audit storage. No links/maps are pinned.
 
-## Round 0 — publish your Windows changes, then pull in Ubuntu
+## Preparation
 
-In Windows GitHub Desktop, confirm `feature/bpf-lsm-sq`, review the changes, commit
-and push that branch. Do not merge into `main` yet. Then in Ubuntu:
+Complete [shared testing setup](TESTING-SETUP.md). It defines how to select your
+current `USB_ID`, `USB_PARTITION` and `USB_MOUNT`, and creates ignored local policies
+and a selected-bus enforcement config. This guide uses those generated files;
+neither a particular username nor a development branch is required.
 
-```bash
-cd ~/df/project/portwatchman
-git status
-git fetch origin
-git switch feature/bpf-lsm-sq
-git pull --ff-only origin feature/bpf-lsm-sq
-git branch --show-current
-git status
-```
-
-If the local branch does not exist, use
-`git switch --track origin/feature/bpf-lsm-sq` instead of the plain switch.
-Resolve any local changes before switching; do not reset or discard them.
+Start each terminal in your actual repository root. Shell variables are local to a
+terminal; repeat the relevant assignments when opening another terminal. Recheck
+device IDs and mounts after reconnecting. If the device moves to a different bus,
+restore the old test configuration before regenerating it for the current topology.
 
 ## Round 1 — build and ordinary tests (no USB needed)
 
@@ -101,47 +95,153 @@ cleanup; it never formats a physical drive. Requires `mkfs.ext4`, `losetup`, `mo
 Checks: exact `EACCES` on read/write opens, permitted controls, multiple targets,
 counters, runtime removal, rename/replacement behaviour, unlink expiry, duplicate
 registration, bad commands, oversize input, unexpected stdin EOF, SIGTERM and STOP.
-Socket checks exercise all five commands, expected file/connection identity,
+Socket checks exercise the controller commands, expected file/connection identity,
 existing-socket refusal, permissions and non-root rejection. To reach SO_PEERCRED
 itself, the test briefly relaxes permissions on **its own disposable test socket
 under `/run/portwatchman-lsm-test-*`**, then restores them. It never relaxes the
-production socket. Expected result: `All BPF-LSM acceptance checks passed`.
+production socket. The loopback test also confirms that held file references
+prevent unmounting until PREPARE_REMOVE releases them, then unmounts/remounts only
+its own verified loop fixture while the controller remains running. Expected result:
+`All BPF-LSM acceptance checks passed`.
 
 ## Round 3 — standalone physical USB acceptance
 
+With the selected test drive connected, authorise it using your matching policy:
+
 ```bash
-lsusb
-python3 src/policy/device_policy.py list
+sudo python3 src/enforcement/usb_authorization.py \
+  --policy logs/test-allow.json authorize "$USB_ID" --apply
 lsblk -o NAME,TRAN,SIZE,FSTYPE,MOUNTPOINTS
 ```
 
-Rediscover the current USB ID, bus and mount. Your newer drive was `4-1` / `usb4`,
-VID `058f`, PID `6387`, serial `CDCC363B`; these paths can change. Do not reuse the
-mouse's ID or assume `/dev/sdb1` without checking.
-
-For this round the test drive must be authorised and mounted. Restore any previous
-default-deny test using the exact configuration that owns its saved state, then
-authorise the drive using its matching policy. A blocked device has no accessible
-filesystem to test.
-
-Replace `ACTUAL_VOLUME` with the verified mount:
+If needed, mount the verified USB partition with `udisksctl mount -b "$USB_PARTITION"`.
+Set `USB_MOUNT` to its actual mount directory as described in shared setup, then:
 
 ```bash
-findmnt -T '/media/ryelle/ACTUAL_VOLUME' -o SOURCE,TARGET,FSTYPE
-sudo python3 tests/enforcement/test_bpf_lsm.py --usb '/media/ryelle/ACTUAL_VOLUME'
+findmnt -T "$USB_MOUNT" -o SOURCE,TARGET,FSTYPE
+sudo python3 tests/enforcement/test_bpf_lsm.py --usb "$USB_MOUNT"
 ```
 
-The runner verifies USB ancestry and creates/removes only an owned
-`portwatchman-lsm-*` test directory. Keep the drive mounted/connected for the entire
-run. Expected result: `All BPF-LSM acceptance checks passed`.
+The runner independently verifies USB ancestry and creates/removes an owned
+`portwatchman-lsm-*` test directory. It does not select existing user files or format
+the drive. Keep the drive mounted/connected for this run. Expected final line:
+`All BPF-LSM acceptance checks passed`.
 
-## Round 4 — manually demonstrate the socket commands
+## Round 4 — manual socket demonstration and bridge fixture
 
-Create two fresh disposable files on the verified USB mount:
+With the drive still authorised and mounted, create a fresh, owned demonstration
+directory. This script verifies the selected mount against your current USB ID,
+creates two new test files and records their relative directory in `logs/`. It also
+creates the bridge config needed for Round 5. It does not overwrite existing USB files.
 
 ```bash
-(set -C; printf 'restricted test\n' > '/media/ryelle/ACTUAL_VOLUME/portwatchman-lsm-test.txt')
-(set -C; printf 'control test\n' > '/media/ryelle/ACTUAL_VOLUME/portwatchman-control.txt')
+python3 - "$USB_ID" "$USB_MOUNT" <<'PY'
+import json
+from pathlib import Path
+import sys
+import tempfile
+
+sys.path.insert(0, "src/enforcement")
+from lsm_bridge import UsbTargetResolver
+
+usb_id, mount = sys.argv[1], Path(sys.argv[2]).resolve(strict=True)
+mounts = {Path(p).resolve(strict=True) for p in UsbTargetResolver().mounts(usb_id)}
+if mount not in mounts:
+    raise SystemExit("The selected directory is not a mount of the selected USB device")
+directory = Path(tempfile.mkdtemp(prefix="portwatchman-demo-", dir=mount))
+for name, content in [("restricted.txt", "Restricted test\n"),
+                      ("control.txt", "Unrestricted control\n")]:
+    with (directory / name).open("x", encoding="utf-8") as output:
+        output.write(content)
+relative = directory.relative_to(mount).as_posix()
+Path("logs/test-lsm-fixture.json").write_text(json.dumps({"relative_directory": relative}) + "\n")
+config = {"schema_version": 1, "socket_path": "/run/portwatchman/lsm_controller.sock",
+          "registration_timeout_seconds": 30, "on_error": "report",
+          "rules": [{"allowlist_rule": "test-usb", "protected_paths": [relative + "/restricted.txt"]}]}
+Path("logs/test-lsm.json").write_text(json.dumps(config, indent=2) + "\n")
+print("Created demonstration files at:", directory)
+PY
+```
+
+In each terminal that will read the files, set its current `USB_MOUNT` and run:
+
+```bash
+USB_RELATIVE_DIR=$(python3 -c 'import json; from pathlib import Path; print(json.loads(Path("logs/test-lsm-fixture.json").read_text())["relative_directory"])')
+USB_DEMO="$USB_MOUNT/$USB_RELATIVE_DIR"
+cat "$USB_DEMO/restricted.txt"
+cat "$USB_DEMO/control.txt"
+```
+
+Both files should initially be readable. Terminal A:
+
+```bash
+sudo src/enforcement/bpf/build/lsm_controller --usb --serve
+```
+
+Wait for `lsm_ready`. Terminal B, with its `USB_DEMO` set as above:
+
+```bash
+sudo python3 src/enforcement/lsm_client.py STATUS
+sudo python3 src/enforcement/lsm_client.py ADD "$USB_DEMO/restricted.txt"
+sudo python3 src/enforcement/lsm_client.py LIST
+cat "$USB_DEMO/restricted.txt"
+cat "$USB_DEMO/control.txt"
+cat /etc/hostname
+sudo python3 src/enforcement/lsm_client.py STATUS
+```
+
+Expect selected-file denial, readable controls and an increasing denial count.
+Replace `TARGET_ID` with the ID returned by this controller's ADD/LIST response:
+
+```bash
+sudo python3 src/enforcement/lsm_client.py REMOVE TARGET_ID
+cat "$USB_DEMO/restricted.txt"
+sudo python3 src/enforcement/lsm_client.py STOP
+```
+
+The selected file should become readable after REMOVE. Wait for Terminal A to exit
+with `lsm_stopped`, `ok: true`. STOP detaches and removes its owned socket; the empty
+0700 socket directory may remain. Keep the demonstration files for Round 5.
+
+## Round 5 — opt-in Python bridge and live pipeline
+
+Only `enforce --lsm-config FILE` enables the bridge. Direct `authorize` and
+`reconcile` do not register targets. The bridge handles new correlated connections,
+so reconnect the drive after the pipeline is healthy.
+
+The sequence is: allowlist match → authorise USB → mount filesystem → register
+selected files → `lsm_bridge_registered`. There is an access window between USB
+authorisation and file registration. Missing mounts/files retry on upstream events,
+normally five-second heartbeats, until the configured deadline. Protection is
+confirmed only by `lsm_bridge_registered` with `protection_complete: true`.
+
+### Failure-policy choice
+
+Review `logs/test-lsm.json` before enabling it:
+
+- `on_error: report` reports protection failure and leaves the USB authorised. This
+  is the generated demonstration setting and the live-validated failure policy.
+- `on_error: deauthorize` additionally attempts to block the same still-current USB
+  connection and can interrupt I/O. It is implemented and unit-tested; live acceptance
+  for this option is not part of the recorded results.
+
+Existing map entries can remain after a bridge error while the controller is alive.
+No protection survives controller exit. The bridge reports failure instead of
+claiming that a lost or incomplete restriction is active.
+
+### Run the matching policy
+
+Stop any controller from Round 4. Unmount the verified partition and disconnect:
+
+```bash
+udisksctl unmount -b "$USB_PARTITION"
+```
+
+After successful unmounting, disconnect the drive, then arm the selected bus:
+
+```bash
+sudo python3 src/enforcement/usb_authorization.py \
+  --config logs/test-enforcement.json arm --apply
 ```
 
 Terminal A:
@@ -150,231 +250,163 @@ Terminal A:
 sudo src/enforcement/bpf/build/lsm_controller --usb --serve
 ```
 
-Wait for `lsm_ready`. Terminal B:
+Terminal B:
 
 ```bash
-sudo python3 src/enforcement/lsm_client.py STATUS
-sudo python3 src/enforcement/lsm_client.py ADD '/media/ryelle/ACTUAL_VOLUME/portwatchman-lsm-test.txt'
-sudo python3 src/enforcement/lsm_client.py LIST
-cat '/media/ryelle/ACTUAL_VOLUME/portwatchman-lsm-test.txt'
-cat '/media/ryelle/ACTUAL_VOLUME/portwatchman-control.txt'
-cat /etc/hostname
-sudo python3 src/enforcement/lsm_client.py STATUS
-```
-
-Expect permission denied only for the selected file, and an increasing denial
-count. Use the actual returned `target_id` in place of `TARGET_ID`:
-
-```bash
-sudo python3 src/enforcement/lsm_client.py REMOVE TARGET_ID
-cat '/media/ryelle/ACTUAL_VOLUME/portwatchman-lsm-test.txt'
-sudo python3 src/enforcement/lsm_client.py STOP
-```
-
-The file becomes readable after REMOVE. STOP detaches and removes the owned socket;
-Terminal A exits. A clean run reports `lsm_stopped` with `ok: true`. Socket directory
-permissions remain 0700; the empty directory may remain for the next start.
-
-## Round 5 — opt-in Python bridge / live pipeline
-
-This round is **Stage 5 of the BPF-LSM roadmap**, within overall project Step 6.
-Only `enforce --lsm-config FILE` enables it. Ordinary Step 5 commands remain usable.
-Direct `authorize` and `reconcile` do not register LSM targets; this prototype bridge
-handles new correlated pipeline connections only. Disconnect/reconnect the test
-drive after the pipeline is ready.
-
-The order is: allowlist match → authorise USB → mount filesystem → register selected
-files → confirm `lsm_bridge_registered`. A desktop may automount the drive; otherwise
-mount it manually after authorisation. There is a registration window in which the
-USB is accessible before the selected files are restricted. Missing mounts/files
-retry on upstream events (normally every five-second heartbeat), up to the configured
-deadline. Do not claim protection before the registration confirmation.
-
-### Choose registration-failure behaviour explicitly
-
-- `on_error: report`: report failure, return an unsuccessful pipeline outcome and
-  leave the USB authorised. Existing installed restrictions are retained.
-- `on_error: deauthorize`: additionally attempt to block the **same still-current
-  USB connection**. This can interrupt I/O. Replacement devices are not revoked.
-
-The example uses `report` for demonstration; it is not enabled automatically. Review
-this choice before copying/enabling it. No automatic deauthorisation was selected
-by the project owner. Invalid/unavailable controller configuration prevents startup
-before the bridge-enabled pipeline authorises any device.
-
-### Prepare test-only configuration
-
-While the intended test drive is still authorised/mounted, keep the two disposable
-files from Round 4. Stop the Round 4 controller. Set the current device ID (replace
-this example if different), inspect it and review its identity:
-
-```bash
-mkdir -p logs
-PW_USB_ID=4-1
-python3 src/policy/device_policy.py inspect "$PW_USB_ID" > logs/step6-usb-device.json
-cat logs/step6-usb-device.json
-```
-
-The following creates isolated test policies/configs; it does not arm a bus or write
-to the USB. It refuses an existing Step 6 state file to avoid overwriting saved
-original defaults. Restore the old test first if that state exists.
-
-```bash
-python3 - <<'PY'
-import json
-from pathlib import Path
-
-device = json.loads(Path('logs/step6-usb-device.json').read_text())['device']
-assert not device['is_root_hub']
-assert device['vendor_id'] == '058f' and device['product_id'] == '6387'
-assert device.get('serial'), 'This test requires a drive serial number'
-assert not Path('logs/step6-enforcement-state.json').exists(), 'Restore the previous Step 6 arm state first'
-rule = {'name': 'step6-test-drive', 'vendor_id': device['vendor_id'],
-        'product_id': device['product_id'], 'serial': device['serial']}
-allow = {'schema_version': 1, 'default_action': 'block', 'allowlist': [rule]}
-deny = {'schema_version': 1, 'default_action': 'block', 'allowlist': []}
-enforcement = {'schema_version': 1, 'managed_buses': ['usb' + str(device['bus'])],
-               'state_file': 'logs/step6-enforcement-state.json'}
-bridge = {'schema_version': 1, 'socket_path': '/run/portwatchman/lsm_controller.sock',
-          'registration_timeout_seconds': 30, 'on_error': 'report',
-          'rules': [{'allowlist_rule': 'step6-test-drive',
-                     'protected_paths': ['portwatchman-lsm-test.txt']}]}
-for name, document in [('step6-allow.json', allow), ('step6-deny.json', deny),
-                       ('step6-enforcement.json', enforcement), ('step6-lsm.json', bridge)]:
-    Path('logs', name).write_text(json.dumps(document, indent=2) + '\n')
-print('Prepared test configs using report-only registration failure handling.')
-PY
-python3 src/policy/device_policy.py --policy logs/step6-allow.json validate
-```
-
-This example targets your reported `058f:6387` flash drives. Adapt the explicit
-assertions if using another test device, after reviewing its identity. Keep these
-test configs under ignored `logs/`.
-
-Safely unmount the actual USB partition shown by `lsblk`, then unplug/disconnect the
-drive from the guest. Do not select the Ubuntu system disk. Arm the selected bus:
-
-```bash
-sudo python3 src/enforcement/usb_authorization.py --config logs/step6-enforcement.json arm --apply
-```
-
-Terminal A — leave the native controller running:
-
-```bash
-sudo src/enforcement/bpf/build/lsm_controller --usb --serve
-```
-
-Terminal B — start the pipeline:
-
-```bash
-cd ~/df/project/portwatchman
 set -o pipefail
 sudo -v
 sudo python3 src/monitor/usb_monitor.py |
-  python3 src/policy/device_policy.py --policy logs/step6-allow.json watch |
+  python3 src/policy/device_policy.py --policy logs/test-allow.json watch |
   sudo python3 src/enforcement/usb_authorization.py \
-    --config logs/step6-enforcement.json --policy logs/step6-allow.json \
-    enforce --lsm-config logs/step6-lsm.json
+    --config logs/test-enforcement.json --policy logs/test-allow.json \
+    enforce --lsm-config logs/test-lsm.json
 ```
 
-Wait for `lsm_bridge_started` and healthy monitoring, then connect the USB to Ubuntu.
-Expect `enforcement_result` allow, `lsm_bridge_pending`, then
-`lsm_bridge_registered` with `protection_complete: true`. If it is not automounted,
-use a third terminal to identify/mount the actual USB partition before the deadline.
+Wait for `lsm_bridge_started` and healthy monitoring, then reconnect. Expect allow,
+`lsm_bridge_pending`, then `lsm_bridge_registered`. If the partition is not
+automounted, identify it with `lsblk` and mount it before the 30-second deadline.
 
-In Terminal C, rediscover the mount and verify:
+In Terminal C, recheck/set `USB_ID`, `USB_PARTITION` and `USB_MOUNT`. Reconstruct
+`USB_DEMO` using the saved relative-directory block in Round 4, then:
 
 ```bash
-lsblk -o NAME,TRAN,SIZE,FSTYPE,MOUNTPOINTS
 sudo python3 src/enforcement/lsm_client.py STATUS
-cat '/media/ryelle/ACTUAL_VOLUME/portwatchman-lsm-test.txt'
-cat '/media/ryelle/ACTUAL_VOLUME/portwatchman-control.txt'
+cat "$USB_DEMO/restricted.txt"
+cat "$USB_DEMO/control.txt"
 cat /etc/hostname
 sudo python3 src/enforcement/lsm_client.py STATUS
 ```
 
-Expect exact selected-file denial, successful controls, a nonempty connection ID on
-the guard target and an increasing counter. These checks establish filesystem
-enforcement; `enforcement_result` allow alone establishes only USB authorisation.
+Expect selected-file denial, readable controls, increasing counters and a nonempty
+connection ID. An allow result alone proves USB authorisation, not file protection.
 
-### Stop, disconnect and repeat
+### Coordinated removal and reconnect
 
-Ctrl+C in Terminal B is a deliberate normal stop. A healthy bridge removes only
-registrations it owns; it does not stop the C controller or remove somebody else's
-targets. STATUS should show its targets removed and the test file readable again.
-Default-deny remains armed until explicit restore.
+The controller holds O_PATH references to preserve file identity. Those references
+also keep the mount busy. Release them intentionally before normal unmounting;
+leave both the controller and pipeline running.
 
-For lifecycle testing, restart the pipeline, reconnect and wait for registration.
-The controller deliberately holds O_PATH references to protected file identities.
-Those references also keep the filesystem mounted: normal unmount can report
-`target is busy` while a target is registered. Release the connection intentionally
-before unmounting, while keeping both the controller and pipeline running:
+The following reads live STATUS and chooses the one current connection for your
+selected `USB_ID`. It sends no mutation if the controller is degraded or the choice
+is missing/ambiguous. It also binds the request to the same controller instance.
+
+```bash
+sudo python3 - "$USB_ID" <<'PY'
+import json
+import sys
+
+sys.path.insert(0, "src/enforcement")
+from lsm_client import LsmClient
+
+client = LsmClient()
+state = client.status()
+connections = {t["connection_id"] for t in state["targets"] if t["usb_id"] == sys.argv[1]}
+if state["failures"] != 0 or len(connections) != 1 or not all(connections):
+    raise SystemExit("Expected a healthy controller and one current USB connection; nothing changed")
+print(json.dumps(client.request("PREPARE_REMOVE", connection_id=connections.pop())))
+PY
+```
+
+Expect `lsm_connection_prepared`, then `lsm_bridge_prepared_for_removal` in Terminal B
+by the next heartbeat. Wait for the bridge event, then:
 
 ```bash
 sudo python3 src/enforcement/lsm_client.py STATUS
+udisksctl unmount -b "$USB_PARTITION"
 ```
 
-Copy the exact `connection_id` for the drive, not its USB port ID or target ID:
+Expect no active targets for that connection and `failures: 0`. After successful
+unmounting, disconnect. The bridge should emit `lsm_bridge_disconnected`.
+Reconnect without restarting either process: expect a new connection ID/target ID
+and renewed file denial after mounting. Recheck the mount and reconstruct `USB_DEMO`
+before reading its files again. The old ID may remain in `prepared_connections`;
+it must not affect the new registration.
+
+PREPARE_REMOVE explicitly ends selected-file protection; it does not unmount,
+deauthorise or eject the drive. If removal is cancelled, disconnect/reconnect to
+obtain a newly protected connection. If normal unmount still reports busy, another
+application may hold references; inspect with `sudo fuser -vm "$USB_MOUNT"` if
+`fuser` is available. Stopping the owning pipeline/controller normally also releases
+its references. Normal REMOVE without preparation is an unexpected loss to the bridge.
+
+### Deliberate controller-loss test
+
+After successful reconnect and renewed file denial, keep Terminal B running and
+stop the controller from Terminal C:
 
 ```bash
-PW_REMOVE_CONNECTION='PASTE_CURRENT_CONNECTION_ID'
-sudo python3 src/enforcement/lsm_client.py PREPARE_REMOVE "$PW_REMOVE_CONNECTION"
+sudo python3 src/enforcement/lsm_client.py STOP
 ```
 
-Expect `lsm_connection_prepared` from the client, then
-`lsm_bridge_prepared_for_removal` from the pipeline (normally by the next heartbeat).
-Wait for that bridge event; STATUS should show the released connection in
-`prepared_connections` and no targets for it. Protection has intentionally ended
-for that connection, so its selected file is accessible again. Then use normal
-`udisksctl unmount -b /dev/ACTUAL_USB_PARTITION` and disconnect only after successful
-unmounting. If the mount remains busy, inspect other open files/working directories.
-The helper releases only PortWatchman's references, not other applications' files.
+Expect Terminal A to exit and Terminal B to report `lsm_bridge_error`,
+`protection_complete: false`, normally within 5–10 seconds. With `on_error: report`,
+the USB remains authorised and both files become readable:
 
-The bridge remains healthy and waits for physical disconnection. Expect
-`lsm_bridge_disconnected` for the prepared connection. Reconnect with the same
-pipeline/controller running: the new connection gets a new connection ID and target
-ID, and protection is installed again after mounting. Verify selected-file denial
-and a readable control. An old prepare/disconnect cannot remove the new registration.
+```bash
+cat "/sys/bus/usb/devices/$USB_ID/authorized"
+cat "$USB_DEMO/restricted.txt"
+cat "$USB_DEMO/control.txt"
+```
 
-PREPARE_REMOVE is a privileged, explicit request to end selected-file protection;
-it does not unmount, deauthorise or physically eject a drive. Do not continue using
-the mounted drive as though it were protected after preparing removal. If removal
-is cancelled, disconnect/reconnect to obtain a newly protected connection. A normal
-REMOVE without this preparation remains an unexpected loss to the bridge. Stopping
-the pipeline normally is another way to release its targets before unmounting.
+Expect `1` and both contents. Ctrl+C in Terminal B should then produce `ok: false`
+and a nonzero failure count. This is the expected deliberate-failure result.
+Any `lsm_bridge_retained` record refers to registration records and does not prove
+that kernel protection remains. A controller restart changes its instance ID;
+old IDs must not be reused against it. The bridge does not adopt old registrations.
 
-If the controller dies/restarts, the bridge reports failure and never reuses old
-target IDs against the new controller instance. Unexpected pipeline termination or
-registration errors retain installed entries for inspection. Use STATUS and explicit
-REMOVE, or stop the owned controller, before retrying. The bridge does not adopt
-registrations from a previous process. No protection survives controller exit.
+### Rejection with the bridge enabled
 
-### Confirm unapproved USB behaviour remains Step 5's default-deny
+For a separate run, stop/clean up the previous processes, unmount/disconnect the
+drive, arm the selected bus and start a fresh controller as above. Use the generated
+serial-mismatch policy on both policy stages:
 
-Stop the allow pipeline, unmount/unplug the drive and use `logs/step6-deny.json` for
-both policy arguments, omitting `--lsm-config`. Reconnect after healthy monitoring.
-Expect block/already_blocked, `authorized=0`, no USB block device/filesystem, and no
-new LSM target. An empty deny policy has no approved rule to map to a protected file.
+```bash
+set -o pipefail
+sudo -v
+sudo python3 src/monitor/usb_monitor.py |
+  python3 src/policy/device_policy.py --policy logs/test-mismatch.json watch |
+  sudo python3 src/enforcement/usb_authorization.py \
+    --config logs/test-enforcement.json --policy logs/test-mismatch.json \
+    enforce --lsm-config logs/test-lsm.json
+```
 
-### Restore the test environment
+The rule name remains `test-usb`, so the bridge config is valid, but its serial does
+not match. Reconnect after healthy monitoring. Expect block/already_blocked,
+`authorized: 0`, no USB block device/filesystem and no LSM registration. Confirm with
+the sysfs attribute, `lsblk` and controller STATUS. Do not use an empty policy with
+this bridge config: startup correctly refuses a reference to a missing allowlist rule.
 
-Stop the pipeline with Ctrl+C, then stop the owned controller and restore bus defaults:
+### Normal stop and final restoration
+
+For a normal-stop test, repeat a healthy matching run and press Ctrl+C in Terminal B.
+Expect `lsm_bridge_released`, a successful closing record and an empty owned target
+inventory. The selected file becomes readable. The controller remains running until
+STOP or its own signal; targets belonging to other clients are not removed.
+
+Stop the controller, wait for its exit and restore defaults:
 
 ```bash
 sudo python3 src/enforcement/lsm_client.py STOP
 sudo python3 src/enforcement/usb_authorization.py \
-  --config logs/step6-enforcement.json restore --apply
-sudo python3 src/enforcement/usb_authorization.py \
-  --policy logs/step6-allow.json authorize "$PW_USB_ID" --apply
-python3 src/enforcement/usb_authorization.py --config logs/step6-enforcement.json status
+  --config logs/test-enforcement.json restore --apply
+python3 src/enforcement/usb_authorization.py \
+  --config logs/test-enforcement.json status
 pgrep -af 'bpftrace.*usb_events[.]bt'
-lsblk -o NAME,TRAN,SIZE,FSTYPE,MOUNTPOINTS
 ```
 
-Run authorise only if that ID still identifies the intended connected drive. If the
-controller was already stopped, STOP reports unavailable; Ctrl+C in its terminal is
-also valid. Expect restored original defaults, `armed: false`, no monitor backend,
-and normal access to the reauthorised drive.
+If the controller already exited during the failure test, skip STOP. Expect
+`armed: false`, recorded original defaults restored and no monitor backend. If a
+rejected device remains connected/blocked, confirm its current USB ID and use:
+
+```bash
+sudo python3 src/enforcement/usb_authorization.py \
+  --policy logs/test-allow.json authorize "$USB_ID" --apply
+```
+
+An incorrect root command, such as preparation with an obsolete connection ID,
+records a controller failure; the bridge treats that run as degraded even if a
+later command succeeds. Inspect `lsm_error` records and STATUS, then stop both
+processes and restart a clean test. Do not suppress the failure counter.
 
 ## Protocol and lifecycle notes
 
@@ -422,20 +454,20 @@ loading BPF. `--test-loopback` accepts only loop-backed filesystems.
 
 ## Completion evidence
 
-The VM operator supplied passing evidence for the original 173-test revision on
-2026-11-21: build/preflight, all unit tests, loopback/socket and exFAT USB acceptance,
-manual deny/count/remove/stop, bridge allow/register/release and serial-mismatch
-block with an empty LSM inventory. Coordinated removal changes the controller and
-bridge; rebuild and rerun the relevant checks before accepting this revision.
+The Step 6 milestone was validated in the recorded Ubuntu/VMware environment on
+2026-11-21. These are results for that environment, not guarantees for other kernels
+or hosts. A new deployment should repeat the procedures above.
 
-- [ ] Clean-checkout Ubuntu build and preflight.
-- [ ] Python suite with native CLI tests enabled.
-- [ ] Loopback acceptance, including socket/authentication regressions.
-- [ ] Standalone physical USB acceptance.
-- [ ] Manual ADD/REMOVE/LIST/STATUS/STOP and selected-file counters.
-- [ ] Bridge registration, controls, ownership cleanup, reconnect and failure handling.
-- [ ] Existing Step 5 allow/block and environment restore still pass.
+- [x] Ubuntu build and preflight.
+- [x] All 181 tests, with native CLI checks enabled.
+- [x] Loopback enforcement, socket/authentication and mount-reference release.
+- [x] Standalone physical USB enforcement on an exFAT test filesystem.
+- [x] Manual ADD/REMOVE/LIST/STATUS/STOP and selected-file counters.
+- [x] Automatic bridge registration, permitted controls and normal cleanup.
+- [x] Coordinated preparation, normal unmount, disconnect and reconnect.
+- [x] Serial-mismatch rejection while the bridge is enabled.
+- [x] Controller-loss detection and failed pipeline outcome under `on_error: report`.
+- [x] Original bus defaults restored and monitor backend released.
 
-Mark overall Step 6 complete only after the corresponding Ubuntu results pass.
 Service orchestration, durable logs, response actions and system-wide hardening remain
 outside this implementation milestone.

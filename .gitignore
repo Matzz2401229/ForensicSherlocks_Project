@@ -23,7 +23,3 @@ __pycache__/
 # Generated BPF-LSM build artefacts
 /src/enforcement/bpf/build/lsm_guard.bpf.o
 /src/enforcement/bpf/build/lsm_controller
-
-# Individual testing
-# Uncomment /docs/ after everything is done
-# /docs/
