@@ -140,7 +140,7 @@ def check_rejected(mode, path):
     assert any(row["type"] == "lsm_error" and row["reason"] == "invalid_target" for row in rows), result
 
 
-def run_checks(mode, directory):
+def run_checks(mode, directory, loop_device=None):
     files = [directory / name for name in ("restricted.txt", "second.txt", "control.txt")]
     for path in files:
         with path.open("xb") as stream:
@@ -248,10 +248,10 @@ def run_checks(mode, directory):
     finally:
         client.release()
     print("PASS: rejected/duplicate commands, oversized input and unexpected control EOF remain failures", flush=True)
-    socket_checks(mode, files)
+    socket_checks(mode, files, loop_device=loop_device)
 
 
-def socket_checks(mode, files):
+def socket_checks(mode, files, loop_device=None):
     parent = Path(tempfile.mkdtemp(prefix="portwatchman-lsm-test-", dir="/run"))
     owner = parent.stat()
     path = parent / "controller.sock"
@@ -357,6 +357,56 @@ def socket_checks(mode, files):
         closing = controller.wait_for(lambda row: row["type"] == "lsm_stopped")
         assert closing["ok"] and controller.process.wait(timeout=10) == 0, closing
         controller.release()
+        controller = Controller(mode, socket_path=path)
+        client = LsmClient(str(path))
+        old_connection = "fixture:removal:1"
+        def owned_add(file, connection):
+            inspection = subprocess.run([str(BINARY), mode, "--inspect", str(file)],
+                                        capture_output=True, text=True, timeout=10, check=True)
+            identity = next(json.loads(line)["target"] for line in inspection.stdout.splitlines()
+                            if json.loads(line)["type"] == "lsm_target_inspected")
+            expected = {"expected_" + key: identity[key] for key in ("major", "minor", "inode", "mount_id")}
+            expected.update(expected_usb_id=identity["usb_id"], expected_address=identity["device_address"])
+            return client.request("ADD", path=str(file), connection_id=connection, **expected)
+        old_id = owned_add(files[0], old_connection)["target"]["target_id"]
+        owned_add(files[1], old_connection)
+        unrelated = client.request("ADD", path=str(files[2]))["target"]["target_id"]
+        if loop_device:
+            mountpoint = files[0].parent
+            actual = subprocess.check_output(["findmnt", "-n", "-o", "SOURCE", "--target", str(mountpoint)], text=True).strip()
+            assert actual == loop_device and re.fullmatch(r"/dev/loop[0-9]+", loop_device), actual
+            busy = subprocess.run(["umount", str(mountpoint)], capture_output=True, text=True)
+            assert busy.returncode != 0 and os.path.ismount(mountpoint), "Expected held references to keep the owned loop mount busy"
+        prepared = client.request("PREPARE_REMOVE", connection_id=old_connection)
+        assert prepared["type"] == "lsm_connection_prepared" and prepared["removed_targets"] == 2, prepared
+        state = client.status()
+        assert old_connection in state["prepared_connections"] and state["failures"] == 0, state
+        assert [t["target_id"] for t in state["targets"]] == [unrelated], state
+        readable(files[0])
+        readable(files[1])
+        denied(files[2])
+        client.request("REMOVE", target_id=unrelated)
+        assert client.request("PREPARE_REMOVE", connection_id=old_connection)["already_prepared"] is True
+        blocked_add = owned_add(files[0], old_connection)
+        assert blocked_add["type"] == "lsm_connection_prepared", blocked_add
+        assert not client.status()["targets"]
+        if loop_device:
+            # Only our verified, disposable loop fixture is unmounted/remounted.
+            subprocess.run(["umount", str(mountpoint)], check=True)
+            assert client.status()["enforcement_active"] is True
+            subprocess.run(["mount", loop_device, str(mountpoint)], check=True)
+        fresh = owned_add(files[0], "fixture:removal:2")["target"]
+        assert fresh["target_id"] > old_id
+        client.request("PREPARE_REMOVE", connection_id=old_connection)
+        denied(files[0])
+        assert client.status()["targets"][0]["connection_id"] == "fixture:removal:2"
+        client.request("REMOVE", target_id=fresh["target_id"], connection_id="fixture:removal:2")
+        assert client.status()["failures"] == 0
+        client.request("STOP")
+        closing = controller.wait_for(lambda row: row["type"] == "lsm_stopped")
+        assert closing["ok"] and controller.process.wait(timeout=10) == 0, closing
+        controller.release()
+        print("PASS: coordinated removal, connection isolation, pending ADD refusal and mount-reference release", flush=True)
         # Replacement path belongs to the test, not the controller's socket inode.
         controller = Controller(mode, socket_path=path)
         original = path.lstat()
@@ -435,7 +485,7 @@ def main():
             device = subprocess.check_output(["losetup", "--find", "--show", str(image)], text=True).strip()
             assert re.fullmatch(r"/dev/loop[0-9]+", device), device
             subprocess.run(["mount", device, str(mountpoint)], check=True)
-            run_checks("--test-loopback", mountpoint)
+            run_checks("--test-loopback", mountpoint, loop_device=device)
         finally:
             if os.path.ismount(mountpoint):
                 actual = subprocess.check_output(["findmnt", "-n", "-o", "SOURCE", "--target", str(mountpoint)], text=True).strip()

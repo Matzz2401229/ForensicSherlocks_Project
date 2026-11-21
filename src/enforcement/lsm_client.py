@@ -73,7 +73,7 @@ class LsmClient:
 
     def request(self, command, **fields):
         command = command.upper()
-        if command not in {"ADD", "REMOVE", "LIST", "STATUS", "STOP"}:
+        if command not in {"ADD", "REMOVE", "LIST", "STATUS", "PREPARE_REMOVE", "STOP"}:
             raise LsmClientError("Unknown controller command")
         if any(key in fields for key in ("command", "command_id", "expected_controller_id")):
             raise LsmClientError("Reserved protocol fields cannot be overridden")
@@ -151,6 +151,8 @@ def main():
     remove = sub.add_parser("REMOVE")
     remove.add_argument("target_id", type=int)
     remove.add_argument("--connection-id")
+    prepare = sub.add_parser("PREPARE_REMOVE", help="Release one connection's targets before normal unmount")
+    prepare.add_argument("connection_id")
     args = parser.parse_args()
     fields = {}
     if args.command == "ADD":
@@ -159,6 +161,8 @@ def main():
         fields["target_id"] = args.target_id
         if args.connection_id:
             fields["connection_id"] = args.connection_id
+    if args.command == "PREPARE_REMOVE":
+        fields["connection_id"] = args.connection_id
     try:
         print(json.dumps(LsmClient(args.socket).request(args.command, **fields)))
         return 0

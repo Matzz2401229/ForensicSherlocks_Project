@@ -54,7 +54,7 @@ Install the development dependencies in Ubuntu:
 
 ```bash
 sudo apt update
-sudo apt install -y git python3 bpftrace clang llvm bpftool build-essential libbpf-dev libelf-dev libjson-c-dev pkg-config
+sudo apt install -y git python3 bpftrace clang llvm linux-tools-common build-essential libbpf-dev libelf-dev libjson-c-dev pkg-config
 ```
 
 ### Build and test the supplementary BPF-LSM guard
@@ -88,6 +88,13 @@ Step 6 remains pending target-VM build and acceptance results. A successful Pyth
 suite alone does not validate the kernel program. The guard follows file identity,
 not replacement pathnames; it does not cover existing data descriptors, raw devices,
 mount operations, mmap, HID interfaces, or every hotplug race.
+
+Held file references keep protected mounts busy. With the Python bridge running,
+use `sudo python3 src/enforcement/lsm_client.py PREPARE_REMOVE CONNECTION_ID`, wait
+for `lsm_bridge_prepared_for_removal`, then unmount normally before disconnecting.
+This deliberately ends protection for that connection and lets the same pipeline
+register a new generation after reconnecting. The coordinated-removal revision
+still needs the Ubuntu rebuild and live regression checks described in the guide.
 
 ## Run the project
 

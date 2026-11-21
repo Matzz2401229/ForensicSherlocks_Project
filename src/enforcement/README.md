@@ -30,3 +30,12 @@ reports registration failure and leaves the USB authorised. `deauthorize` is an
 explicit alternative that can interrupt USB I/O. No default runtime config enables
 either policy. This is post-authorisation protection with a registration window,
 not an atomic gate. Live acceptance remains pending the Ubuntu VM tests.
+
+Before unmounting a drive protected by the running bridge, use the root socket
+client's `PREPARE_REMOVE CONNECTION_ID` command and wait for the pipeline's
+`lsm_bridge_prepared_for_removal` event. This intentionally releases that connection's
+map entries and O_PATH references, which otherwise keep the mount busy. Other
+connections remain protected. The bridge waits for disconnect and registers a fresh
+connection on reconnect. Protection is released during preparation; cancelled
+removal requires disconnect/reconnect to enrol again. See the testing guide for
+the complete procedure and evidence recorded so far.

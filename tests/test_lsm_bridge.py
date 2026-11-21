@@ -116,18 +116,26 @@ class FakeClient:
         self.calls = []
         self.next_id = 1
         self.fail = None
+        self.prepared = []
 
     def status(self):
         if self.fail:
             raise self.fail
         return {"mode": "usb", "enforcement_active": True, "failures": 0,
-                "targets": list(self.targets.values())}
+                "targets": list(self.targets.values()), "prepared_connections": self.prepared[:]}
 
     def request(self, command, **fields):
         self.calls.append((command, fields))
         if self.fail:
             raise self.fail
+        if command == "PREPARE_REMOVE":
+            connection = fields["connection_id"]
+            self.prepared.append(connection)
+            self.targets = {i: t for i, t in self.targets.items() if t["connection_id"] != connection}
+            return {"type": "lsm_connection_prepared", "connection_id": connection}
         if command == "ADD":
+            if fields["connection_id"] in self.prepared:
+                return {"type": "lsm_connection_prepared", "connection_id": fields["connection_id"]}
             target = {"target_id": self.next_id, "connection_id": fields["connection_id"]}
             self.targets[self.next_id] = target
             self.next_id += 1
@@ -248,6 +256,90 @@ class BridgeTests(unittest.TestCase):
         self.client.targets.clear()
         self.assertEqual(self.bridge.tick()[0]["type"], "lsm_bridge_error")
         self.assertEqual(self.bridge.failures, 1)
+
+    def test_prepare_removal_is_intentional_and_does_not_fault_bridge(self):
+        self.register()
+        self.client.request("PREPARE_REMOVE", connection_id=self.result["connection_id"])
+        events = self.bridge.tick()
+        self.assertEqual(events[0]["type"], "lsm_bridge_prepared_for_removal")
+        self.assertFalse(events[0]["protection_complete"])
+        self.assertFalse(self.bridge.faulted)
+        self.assertEqual(self.bridge.failures, 0)
+        self.assertFalse(self.client.targets)
+        for _ in range(3):
+            self.assertFalse(self.bridge.tick())
+        self.assertEqual(len([c for c in self.client.calls if c[0] == "ADD"]), 1)
+
+    def test_prepared_removal_then_reconnect_registers_new_generation(self):
+        self.register()
+        old_connection = self.result["connection_id"]
+        self.client.request("PREPARE_REMOVE", connection_id=old_connection)
+        self.bridge.tick()
+        self.bridge.handle({"type": "policy_skipped", "reason": "usb_disconnect_started",
+                            "usb_id": "4-1", "connection_id": old_connection}, None)
+        self.assertFalse(self.bridge.registrations)
+        self.result["connection_id"] = "boot:4-1:200"
+        self.result["device"]["device_address"] = self.device["device_address"] = 3
+        self.bridge.handle({}, self.result)
+        events = self.bridge.tick()
+        self.assertEqual(events[0]["type"], "lsm_bridge_registered")
+        new_id = next(iter(self.client.targets))
+        self.assertGreater(new_id, 1)
+        before = list(self.client.calls)
+        self.bridge.handle({"type": "policy_skipped", "reason": "usb_disconnect_started",
+                            "usb_id": "4-1", "connection_id": old_connection}, None)
+        self.assertEqual(self.client.calls, before)
+        self.assertIn(new_id, self.client.targets)
+
+    def test_prepare_remove_racing_add_closes_held_reference(self):
+        original = self.client.request
+        def race(command, **fields):
+            if command == "ADD":
+                self.client.prepared.append(fields["connection_id"])
+            return original(command, **fields)
+        self.client.request = race
+        self.bridge.handle({}, self.result)
+        events = self.bridge.tick()
+        self.assertEqual(events[0]["type"], "lsm_bridge_prepared_for_removal")
+        self.assertFalse(any(e["type"] == "lsm_bridge_registered" for e in events))
+        self.assertFalse(self.bridge.faulted)
+        self.target.close.assert_called_once()
+
+    def test_prepared_connection_needs_no_device_access_until_disconnect(self):
+        self.register()
+        self.client.request("PREPARE_REMOVE", connection_id=self.result["connection_id"])
+        self.bridge.tick()
+        self.reader.read.side_effect = BridgeError("USB is being removed")
+        self.assertFalse(self.bridge.tick())
+        self.assertFalse(self.bridge.faulted)
+        self.assertFalse(self.bridge.failures)
+
+    def test_prepare_removal_does_not_release_other_connections(self):
+        self.register()
+        self.client.targets[99] = {"target_id": 99, "connection_id": "other-connection"}
+        self.client.request("PREPARE_REMOVE", connection_id=self.result["connection_id"])
+        self.bridge.tick()
+        self.assertEqual(set(self.client.targets), {99})
+
+    def test_prepared_state_survives_bounded_marker_eviction(self):
+        self.register()
+        self.client.request("PREPARE_REMOVE", connection_id=self.result["connection_id"])
+        self.bridge.tick()
+        self.client.prepared.clear()
+        self.assertFalse(self.bridge.tick())
+        self.assertFalse(self.bridge.faulted)
+        self.assertFalse(self.client.targets)
+
+    def test_invalid_prepared_inventory_is_reported(self):
+        self.register()
+        self.client.prepared = [123]
+        self.assertEqual(self.bridge.tick()[0]["type"], "lsm_bridge_error")
+
+    def test_abnormal_stop_does_not_claim_guard_survives_controller_exit(self):
+        self.register()
+        event = self.bridge.close(clean=False)[0]
+        self.assertFalse(event["protection_complete"])
+        self.assertIn("unverified", event["message"])
 
     def test_restart_never_deletes_ids_on_replacement_controller(self):
         self.register()

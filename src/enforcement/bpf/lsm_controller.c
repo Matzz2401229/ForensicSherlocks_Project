@@ -26,7 +26,20 @@ static struct json_object *request_id, *current_request, *socket_reply;
 static bool socket_request, serving;
 static char controller_id[128];
 static struct pw_socket_server server;
+/* Bounded recent intentional-release markers; connection IDs are never port IDs. */
+static char prepared_connections[PW_MAX_TARGETS][256];
+static unsigned next_prepared;
 static const char *string_field(struct json_object *, const char *);
+
+static bool connection_prepared(const char *connection)
+{
+    if (!connection || !*connection)
+        return false;
+    for (unsigned i = 0; i < PW_MAX_TARGETS; i++)
+        if (!strcmp(connection, prepared_connections[i]))
+            return true;
+    return false;
+}
 
 static void signal_handler(int sig)
 {
@@ -74,6 +87,16 @@ static void error_record(const char *reason, const char *message, uint64_t id)
     json_object_object_add(obj, "message", json_object_new_string(message));
     if (id)
         json_object_object_add(obj, "target_id", json_object_new_int64(id));
+    emit(obj);
+}
+
+static void prepared_reply(const char *connection, unsigned removed, bool already)
+{
+    struct json_object *obj = record("lsm_connection_prepared");
+    json_object_object_add(obj, "connection_id", json_object_new_string(connection));
+    json_object_object_add(obj, "removed_targets", json_object_new_int64(removed));
+    json_object_object_add(obj, "already_prepared", json_object_new_boolean(already));
+    json_object_object_add(obj, "protection_complete", json_object_new_boolean(false));
     emit(obj);
 }
 
@@ -157,6 +180,12 @@ static bool bind_request(struct pw_target *target)
 
 static int add_target(const char *path)
 {
+    const char *connection = current_request ? string_field(current_request, "connection_id") : NULL;
+    if (connection_prepared(connection)) {
+        /* A pending bridge ADD may race PREPARE_REMOVE. Do not reopen or re-enrol it. */
+        prepared_reply(connection, 0, true);
+        return 0;
+    }
     struct pw_target candidate;
     char message[256], reason[64];
     int slot = -1;
@@ -234,6 +263,51 @@ static bool remove_target(struct pw_target *target, const char *reason)
     return true;
 }
 
+static void prepare_remove(const char *connection)
+{
+    if (!connection || !*connection || strlen(connection) >= sizeof(prepared_connections[0])) {
+        error_record("invalid_command", "PREPARE_REMOVE requires a nonempty connection_id shorter than 256 bytes", 0);
+        return;
+    }
+    for (const char *c = connection; *c; c++) {
+        if ((unsigned char)*c < 32 || *c == 127) {
+            error_record("invalid_command", "Invalid connection_id", 0);
+            return;
+        }
+    }
+    if (connection_prepared(connection)) {
+        prepared_reply(connection, 0, true);
+        return;
+    }
+    unsigned matched = 0, removed = 0;
+    for (unsigned i = 0; i < PW_MAX_TARGETS; i++)
+        matched += targets[i].used && !strcmp(targets[i].connection_id, connection);
+    if (!matched) {
+        error_record("unknown_connection", "No active targets belong to that connection", 0);
+        return;
+    }
+    /* Publish intent before releasing references. Serialize one socket summary reply;
+     * individual removals still appear on the controller's stdout audit stream. */
+    snprintf(prepared_connections[next_prepared], sizeof(prepared_connections[0]), "%s", connection);
+    next_prepared = (next_prepared + 1) % PW_MAX_TARGETS;
+    bool capture_reply = socket_request, ok = true;
+    socket_request = false;
+    for (unsigned i = 0; i < PW_MAX_TARGETS; i++) {
+        if (targets[i].used && !strcmp(targets[i].connection_id, connection)) {
+            if (!remove_target(&targets[i], "prepared_for_removal")) {
+                ok = false;
+                break;
+            }
+            removed++;
+        }
+    }
+    socket_request = capture_reply;
+    if (!ok)
+        error_record("prepare_remove_failed", "Could not release all targets; controller is stopping", 0);
+    else
+        prepared_reply(connection, removed, false);
+}
+
 static void expire_targets(void)
 {
     char reason[64];
@@ -267,6 +341,11 @@ static void status(void)
         json_object_array_add(items, describe(&targets[i], count));
     }
     json_object_object_add(obj, "targets", items);
+    struct json_object *prepared = json_object_new_array();
+    for (unsigned i = 0; i < PW_MAX_TARGETS; i++)
+        if (*prepared_connections[i])
+            json_object_array_add(prepared, json_object_new_string(prepared_connections[i]));
+    json_object_object_add(obj, "prepared_connections", prepared);
     json_object_object_add(obj, "enforcement_active", json_object_new_boolean(attached));
     json_object_object_add(obj, "denied_opens", json_object_new_int64(total));
     json_object_object_add(obj, "failures", json_object_new_int(failures));
@@ -340,6 +419,8 @@ static void command(char *line, size_t length)
         struct json_object *ack = record("lsm_stop_requested");
         emit(ack);
         stop_requested = 1;
+    } else if (!strcmp(op, "PREPARE_REMOVE")) {
+        prepare_remove(string_field(obj, "connection_id"));
     } else if (!strcmp(op, "ADD") || !strcmp(op, "restrict")) {
         const char *path = string_field(obj, "path");
         if (!path)
@@ -368,7 +449,7 @@ static void command(char *line, size_t length)
             emit(absent);
         }
     } else {
-        error_record("invalid_command", "Use ADD, REMOVE, LIST, STATUS, or STOP", 0);
+        error_record("invalid_command", "Use ADD, REMOVE, LIST, STATUS, PREPARE_REMOVE, or STOP", 0);
     }
     request_id = current_request = NULL;
     json_object_put(obj);

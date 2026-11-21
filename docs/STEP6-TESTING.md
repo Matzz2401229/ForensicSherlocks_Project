@@ -1,7 +1,10 @@
 # Step 6: selected-file BPF-LSM enforcement
 
-Status: implementation prepared on `feature/bpf-lsm-sq`; Ubuntu compilation,
-kernel loading and live acceptance remain to be verified by the VM operator.
+Status: the original revision passed Ubuntu compilation, all 173 tests, loopback
+and physical USB acceptance, manual socket controls, live bridge registration,
+serial-mismatch rejection and clean shutdown. Safe unmount testing exposed held
+O_PATH references keeping the mount busy. This revision adds coordinated removal;
+its Ubuntu rebuild, loopback regression and live reconnect/failure checks are pending.
 Windows test results do not establish successful BPF attachment.
 
 ## Roadmap and current scope
@@ -58,7 +61,7 @@ Resolve any local changes before switching; do not reset or discard them.
 
 ```bash
 sudo apt update
-sudo apt install -y clang llvm bpftool build-essential pkg-config \
+sudo apt install -y clang llvm linux-tools-common build-essential pkg-config \
   libbpf-dev libelf-dev libjson-c-dev python3
 bash src/enforcement/bpf/build.sh
 sudo src/enforcement/bpf/build/lsm_controller --check
@@ -302,12 +305,43 @@ targets. STATUS should show its targets removed and the test file readable again
 Default-deny remains armed until explicit restore.
 
 For lifecycle testing, restart the pipeline, reconnect and wait for registration.
-Safely unmount the drive, then unplug it. Expect cleanup for that connection. A
-new connection gets a new connection ID; an old disconnect cannot remove its
-registrations. Safe unmount before physical removal can already expire a rule;
-if the bridge observes that while the device is still connected, it reports missing
-protection and fails the run. This is a valid degraded result, not a successful file
-denial. Restart after inspecting/cleaning the retained entries.
+The controller deliberately holds O_PATH references to protected file identities.
+Those references also keep the filesystem mounted: normal unmount can report
+`target is busy` while a target is registered. Release the connection intentionally
+before unmounting, while keeping both the controller and pipeline running:
+
+```bash
+sudo python3 src/enforcement/lsm_client.py STATUS
+```
+
+Copy the exact `connection_id` for the drive, not its USB port ID or target ID:
+
+```bash
+PW_REMOVE_CONNECTION='PASTE_CURRENT_CONNECTION_ID'
+sudo python3 src/enforcement/lsm_client.py PREPARE_REMOVE "$PW_REMOVE_CONNECTION"
+```
+
+Expect `lsm_connection_prepared` from the client, then
+`lsm_bridge_prepared_for_removal` from the pipeline (normally by the next heartbeat).
+Wait for that bridge event; STATUS should show the released connection in
+`prepared_connections` and no targets for it. Protection has intentionally ended
+for that connection, so its selected file is accessible again. Then use normal
+`udisksctl unmount -b /dev/ACTUAL_USB_PARTITION` and disconnect only after successful
+unmounting. If the mount remains busy, inspect other open files/working directories.
+The helper releases only PortWatchman's references, not other applications' files.
+
+The bridge remains healthy and waits for physical disconnection. Expect
+`lsm_bridge_disconnected` for the prepared connection. Reconnect with the same
+pipeline/controller running: the new connection gets a new connection ID and target
+ID, and protection is installed again after mounting. Verify selected-file denial
+and a readable control. An old prepare/disconnect cannot remove the new registration.
+
+PREPARE_REMOVE is a privileged, explicit request to end selected-file protection;
+it does not unmount, deauthorise or physically eject a drive. Do not continue using
+the mounted drive as though it were protected after preparing removal. If removal
+is cancelled, disconnect/reconnect to obtain a newly protected connection. A normal
+REMOVE without this preparation remains an unexpected loss to the bridge. Stopping
+the pipeline normally is another way to release its targets before unmounting.
 
 If the controller dies/restarts, the bridge reports failure and never reuses old
 target IDs against the new controller instance. Unexpected pipeline termination or
@@ -362,6 +396,15 @@ queued replies, detaches and exits. Duplicate file identities are rejected. REMO
 of an absent ID is idempotent. Invalid root commands/map failures latch a nonzero
 run outcome; rejected unprivileged clients do not poison it.
 
+PREPARE_REMOVE takes `connection_id` and releases all and only that connection's
+targets before closing their held file references. Its single summary response is
+`lsm_connection_prepared`; detailed target removals remain in stdout audit output.
+Repeated preparation is idempotent. STATUS retains up to 128 recent intentional
+release markers. A bridge already waiting for removal stays in that state even if
+an old marker is later evicted. ADD for a recently prepared connection returns the
+prepared acknowledgement without re-registering it, including when an in-flight
+ADD races preparation. New connection IDs remain eligible for registration.
+
 Bridge ADD includes `connection_id`, expected filesystem major/minor/inode/mount ID,
 USB ID and device address. Python holds O_PATH references through the reply; C
 independently opens and validates the same identity before inserting the map entry.
@@ -378,6 +421,12 @@ status; SIGINT/SIGTERM detach and stop. `--inspect --usb FILE` validates a file 
 loading BPF. `--test-loopback` accepts only loop-backed filesystems.
 
 ## Completion evidence
+
+The VM operator supplied passing evidence for the original 173-test revision on
+2026-11-21: build/preflight, all unit tests, loopback/socket and exFAT USB acceptance,
+manual deny/count/remove/stop, bridge allow/register/release and serial-mismatch
+block with an empty LSM inventory. Coordinated removal changes the controller and
+bridge; rebuild and rerun the relevant checks before accepting this revision.
 
 - [ ] Clean-checkout Ubuntu build and preflight.
 - [ ] Python suite with native CLI tests enabled.

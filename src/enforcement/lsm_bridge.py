@@ -180,6 +180,7 @@ class Registration:
     target_ids: list = field(default_factory=list)
     ready: bool = False
     failed: bool = False
+    prepared: bool = False
 
 
 class LsmBridge:
@@ -218,6 +219,16 @@ class LsmBridge:
             if reply.get("type") not in ("lsm_target_removed", "lsm_target_absent"):
                 raise BridgeError("Controller did not acknowledge restriction removal")
             registration.target_ids.remove(target_id)
+
+    def _mark_prepared(self, registration):
+        if registration.prepared:
+            return []
+        registration.prepared = True
+        registration.ready = False
+        registration.target_ids.clear()
+        return [self._event("lsm_bridge_prepared_for_removal", registration,
+                            protection_complete=False,
+                            message="Selected-file protection released; unmount before disconnecting")]
 
     def _failure(self, registration, error):
         if registration.failed:
@@ -295,8 +306,15 @@ class LsmBridge:
             state = self.client.status()
             if state.get("mode") != "usb" or state.get("failures") != 0:
                 raise BridgeError("Controller is degraded")
+            prepared = state.get("prepared_connections", [])
+            if not isinstance(prepared, list) or len(prepared) > 128 or any(not isinstance(c, str) for c in prepared):
+                raise BridgeError("Invalid prepared-connection inventory")
             inventory = {(t.get("target_id"), t.get("connection_id")) for t in state["targets"]}
             for registration in self.registrations.values():
+                if registration.connection_id in prepared:
+                    events.extend(self._mark_prepared(registration))
+                if registration.prepared:
+                    continue
                 if registration.ready:
                     self._current(registration)
                     if any((i, registration.connection_id) not in inventory for i in registration.target_ids):
@@ -306,7 +324,7 @@ class LsmBridge:
                 events.extend(self._failure(registration, error))
             return events
         for registration in list(self.registrations.values()):
-            if registration.ready or self.faulted:
+            if registration.ready or registration.prepared or self.faulted:
                 continue
             targets = []
             try:
@@ -319,15 +337,19 @@ class LsmBridge:
                     reply = self.client.request("ADD", path=target.path, connection_id=registration.connection_id,
                                                 expected_usb_id=registration.usb_id,
                                                 expected_address=registration.device["device_address"], **target.fields)
+                    if reply.get("type") == "lsm_connection_prepared" and reply.get("connection_id") == registration.connection_id:
+                        events.extend(self._mark_prepared(registration))
+                        break
                     row = reply.get("target", {})
                     target_id = row.get("target_id")
                     if (reply.get("type") != "lsm_target_added" or type(target_id) is not int or target_id <= 0
                             or row.get("connection_id") != registration.connection_id):
                         raise BridgeError("Controller did not confirm the owned registration")
                     registration.target_ids.append(target_id)
-                registration.ready = True
-                events.append(self._event("lsm_bridge_registered", registration,
-                                          target_ids=list(registration.target_ids), protection_complete=True))
+                if not registration.prepared:
+                    registration.ready = True
+                    events.append(self._event("lsm_bridge_registered", registration,
+                                              target_ids=list(registration.target_ids), protection_complete=True))
             except TargetPending:
                 if self.clock() >= registration.deadline:
                     events.extend(self._failure(registration, BridgeError("Registration deadline exceeded")))
@@ -347,7 +369,8 @@ class LsmBridge:
         # Unexpected upstream termination or registration failure retains restrictions.
         if not clean or self.failures:
             return [{"type": "lsm_bridge_retained", "connections": list(self.registrations),
-                     "message": "Inspect controller STATUS; restrictions remain until REMOVE/STOP"}]
+                     "protection_complete": False,
+                     "message": "Registration records retained; kernel state is unverified. Inspect the controller before retrying; no protection survives controller exit."}]
         for connection, registration in list(self.registrations.items()):
             try:
                 self._remove(registration)
