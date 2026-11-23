@@ -1,27 +1,8 @@
 #!/usr/bin/env python3
-"""Run configurable anti-forensic responses when an unapproved USB device is blocked (step 7).
+"""PortWatchman step 7: configurable responses for blocked USB devices.
 
-Reads the enforcement stage's NDJSON on stdin and, for each blocked device, runs the
-ordered actions in ``config/responses.json``:
-- ``lock_session``: lock every graphical session through systemd-logind.
-- ``delete``: overwrite, truncate, rename and unlink configured files or directories.
-- ``sanitise``: delete common user activity traces (recent files, thumbnails, shell
-  history, trash) and drop the kernel page cache.
-- ``power``: power off or reboot, gracefully, forced, or immediately via sysrq.
-
-Design notes:
-- Every command is a dry run unless ``--apply`` is given, because these actions are
-  destructive. A dry run reports exactly what would be locked, deleted or powered off.
-- Actions run in the configured order. ``power`` must be last, because nothing runs
-  after it; a failed action is reported and the remaining actions still run.
-- Deletion is confined to ``allowed_roots`` (and, for ``sanitise``, the listed home
-  directories). Paths are checked when the config loads and again, with symlinks
-  resolved, just before each deletion. Symlinks are removed, never followed.
-- Triggers: a blocked device; optionally a skipped block decision (``include_skipped``)
-  or a step 6 BPF-LSM bridge error on an allowed drive (``include_lsm_errors``).
-- A cooldown stops a device that keeps reconnecting from re-running the plan, and once
-  a power action has been issued every later trigger is suppressed.
-- The proc root and command runner are injectable so the logic is unit-testable.
+Reads enforcement records on stdin and runs the configured actions
+(lock_session, delete, sanitise, power). Dry run unless --apply is given.
 """
 from __future__ import annotations
 
@@ -45,10 +26,10 @@ CHUNK_BYTES = 1024 * 1024
 COMMAND_TIMEOUT_S = 15
 
 ACTION_TYPES = ("lock_session", "delete", "sanitise", "power")
-POWER_MODES = {"poweroff": "o", "reboot": "b"}  # value: sysrq trigger character
+POWER_MODES = {"poweroff": "o", "reboot": "b"}  # sysrq key for each mode
 POWER_METHODS = ("graceful", "force", "immediate")
 
-# Per-user activity traces, relative to a home directory. drop_caches is system-wide.
+# Trace files per home folder; drop_caches is system-wide.
 SANITISE_ITEMS = {
     "recent_files": (".local/share/recently-used.xbel",),
     "thumbnails": (".cache/thumbnails",),
@@ -57,7 +38,7 @@ SANITISE_ITEMS = {
     "drop_caches": (),
 }
 
-# Never accepted as (or inside) a deletion root: deleting here would damage the OS.
+# Deletion is never allowed inside these system folders.
 FORBIDDEN_TREES = ("/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/libx32",
                    "/proc", "/run", "/sbin", "/snap", "/sys", "/usr", "/var")
 
@@ -67,7 +48,7 @@ class ResponseError(RuntimeError):
 
 
 def emit(record):
-    """Print one record as a single schema-tagged JSON line (the shared NDJSON format)."""
+    """Print one record as a JSON line."""
     print(json.dumps({"schema_version": SCHEMA_VERSION, **record}, separators=(",", ":")), flush=True)
 
 
@@ -88,18 +69,18 @@ def _parse_json(raw, what):
 
 
 def _within(path, root):
-    """True if ``path`` is ``root`` or inside it (both already absolute and normalised)."""
+    """True if path is root or inside it."""
     return path == root or root in path.parents
 
 
 def _check_root(value, what):
-    """Validate a deletion root: absolute, at least two levels deep, not a system tree."""
+    """Check a path is absolute, at least two levels deep and outside system folders."""
     if not isinstance(value, str) or not value or "\x00" in value:
         raise ResponseError(f"{what} must be a non-empty path string")
     path = Path(os.path.normpath(value))
     if not path.is_absolute():
         raise ResponseError(f"{what} must be an absolute path: {value!r}")
-    if len(path.parts) < 3:  # ("/", "home", "nelson") is the shallowest accepted
+    if len(path.parts) < 3:  # e.g. /home/nelson
         raise ResponseError(f"{what} is too broad (needs at least two levels, e.g. /home/user): {value!r}")
     for tree in FORBIDDEN_TREES:
         if _within(path, Path(tree)):
@@ -178,7 +159,7 @@ def _passes(action):
 
 
 def validate_document(document, path=None):
-    """Validate a parsed responses config and return a normalised Config."""
+    """Validate a parsed config and return a Config."""
     if not isinstance(document, dict):
         raise ResponseError("Config must be a JSON object")
     _check_keys(document, ("schema_version", "trigger", "cooldown_seconds", "allowed_roots", "actions"),
@@ -236,7 +217,7 @@ def load_config(path):
 
 
 class SystemExecutor:
-    """Side effects behind one seam: commands, /proc writes, disk sync and random data."""
+    """Runs commands and /proc writes; tests swap in fakes."""
 
     def __init__(self, proc_root=PROC_ROOT, runner=subprocess.run, sync=os.sync, randbytes=os.urandom):
         self.proc_root = Path(proc_root)
@@ -245,7 +226,7 @@ class SystemExecutor:
         self.randbytes = randbytes
 
     def run(self, argv):
-        """Run a command; return (ok, detail). Never raises for a failing command."""
+        """Run a command and return (ok, error message)."""
         try:
             done = self.runner(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True,
                                timeout=COMMAND_TIMEOUT_S, check=False)
@@ -266,12 +247,12 @@ class SystemExecutor:
             raise ResponseError(f"Cannot write /proc/{relative}: {error}") from error
 
 
-# --- Secure deletion -------------------------------------------------------------------
+# Secure deletion
 
 @dataclass
 class DeleteReport:
     files: int = 0
-    others: int = 0  # symlinks, FIFOs, sockets, device nodes: unlinked, never opened
+    others: int = 0  # symlinks, pipes, device files
     dirs: int = 0
     bytes: int = 0
     absent: list = field(default_factory=list)
@@ -288,15 +269,12 @@ class DeleteReport:
 
 
 def _real_location(path):
-    """Resolve the parent directory's symlinks but keep the final component as named.
-
-    This is where an unlink would actually act, so it is what must stay inside the root.
-    """
+    """Resolve symlinks in the parent folder, keeping the last name as it is."""
     return Path(os.path.realpath(path.parent)) / path.name
 
 
 def _overwrite_file(path, passes, randbytes):
-    """Overwrite a regular file in place, then truncate, rename and unlink it. Returns its size."""
+    """Overwrite a file with random data, empty it, rename it and delete it."""
     flags = os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     fd = os.open(path, flags)
     try:
@@ -319,7 +297,7 @@ def _overwrite_file(path, passes, randbytes):
         os.fsync(fd)
     finally:
         os.close(fd)
-    # A random name hides the original file name from a later directory-entry scan.
+    # Rename first so the original name is not left behind.
     scrambled = path.with_name("." + secrets.token_hex(8))
     os.rename(path, scrambled)
     os.unlink(scrambled)
@@ -327,7 +305,7 @@ def _overwrite_file(path, passes, randbytes):
 
 
 def _remove_entry(path, passes, apply, report, randbytes):
-    """Delete one non-directory entry: overwrite regular files, unlink everything else."""
+    """Overwrite and delete a file; just unlink links and special files."""
     try:
         info = os.lstat(path)
     except FileNotFoundError:
@@ -344,7 +322,7 @@ def _remove_entry(path, passes, apply, report, randbytes):
         if stat.S_ISREG(info.st_mode):
             report.bytes += _overwrite_file(path, passes, randbytes)
             report.files += 1
-        else:  # symlink, fifo, socket or device node: never open it, just remove the name
+        else:
             os.unlink(path)
             report.others += 1
     except OSError as error:
@@ -352,14 +330,11 @@ def _remove_entry(path, passes, apply, report, randbytes):
 
 
 def secure_delete(target, roots, passes, apply, randbytes=os.urandom, report=None):
-    """Securely delete ``target`` (file, symlink or directory tree) if it lies inside ``roots``.
-
-    The containment check is repeated here, with symlinks in the parent path resolved,
-    because the filesystem may have changed since the config was validated.
-    """
+    """Securely delete a file or folder tree that lies inside the allowed roots."""
     report = report or DeleteReport()
     target = Path(target)
     real = _real_location(target)
+    # Re-check in case the path changed since the config was loaded.
     real_roots = [Path(os.path.realpath(root)) for root in roots]
     if not any(_within(real, root) and real != root for root in real_roots):
         report.errors.append({"path": str(target), "error": "outside allowed roots after resolving symlinks"})
@@ -379,8 +354,7 @@ def secure_delete(target, roots, passes, apply, randbytes=os.urandom, report=Non
     def walk_error(error):
         report.errors.append({"path": str(getattr(error, "filename", target)), "error": str(error)})
 
-    # Bottom-up and without following links, so a symlinked directory is removed as a link
-    # and every directory is reached after its contents.
+    # Walk bottom-up without following symlinks.
     dirs = []
     for directory, subdirs, files in os.walk(real, topdown=False, onerror=walk_error, followlinks=False):
         base = Path(directory)
@@ -388,7 +362,7 @@ def secure_delete(target, roots, passes, apply, randbytes=os.urandom, report=Non
             _remove_entry(base / name, passes, apply, report, randbytes)
         for name in subdirs:
             child = base / name
-            if child.is_symlink():  # os.walk lists symlinked dirs in subdirs
+            if child.is_symlink():  # symlinked folders are listed here
                 _remove_entry(child, passes, apply, report, randbytes)
         dirs.append(base)
     for directory in dirs:
@@ -404,23 +378,21 @@ def secure_delete(target, roots, passes, apply, randbytes=os.urandom, report=Non
     return report
 
 
-# --- Actions ---------------------------------------------------------------------------
+# Actions
 
 def power_command(action):
-    """The command (or sysrq write) a power action issues."""
+    """Build the command for a power action."""
     mode, method = action["mode"], action["method"]
     if method == "immediate":
         return {"sysrq": POWER_MODES[mode]}
     argv = ["systemctl", mode]
     if method == "force":
-        # Skip stopping units one by one; systemd still kills processes and unmounts or
-        # remounts file systems read-only, so it is much faster but not a hard power cut.
-        argv.append("--force")
+        argv.append("--force")  # skip stopping services one by one
     return {"argv": argv}
 
 
 class ActionRunner:
-    """Run (or, in a dry run, describe) one configured action and report the outcome."""
+    """Run one action, or describe it in a dry run."""
 
     def __init__(self, config, executor, apply=False):
         self.config = config
@@ -436,7 +408,7 @@ class ActionRunner:
         return ok, detail
 
     def _lock_session(self, action):
-        argv = ["loginctl", "lock-sessions"]  # as root this locks every session
+        argv = ["loginctl", "lock-sessions"]  # locks every session when run as root
         if not self.apply:
             return True, {"would_run": argv}
         ok, error = self.executor.run(argv)
@@ -464,7 +436,7 @@ class ActionRunner:
             if self.apply:
                 try:
                     self.executor.sync()
-                    self.executor.write_proc("sys/vm/drop_caches", "3\n")  # page cache + dentries/inodes
+                    self.executor.write_proc("sys/vm/drop_caches", "3\n")
                     detail["drop_caches"] = "done"
                 except (ResponseError, OSError) as error:
                     ok = False
@@ -478,7 +450,7 @@ class ActionRunner:
         if not self.apply:
             return True, {"mode": action["mode"], "method": action["method"], "would_issue": command}
         if "sysrq" in command:
-            self.executor.sync()  # sysrq poweroff/reboot does not flush dirty pages itself
+            self.executor.sync()  # sysrq does not save pending writes itself
             self.executor.write_proc("sysrq-trigger", command["sysrq"])
             return True, {"mode": action["mode"], "method": action["method"], "issued": command}
         ok, error = self.executor.run(command["argv"])
@@ -486,17 +458,13 @@ class ActionRunner:
                     **({"error": error} if error else {})}
 
 
-# --- Pipeline stage --------------------------------------------------------------------
+# Pipeline stage
 
 TRIGGER_FIELDS = ("usb_id", "connection_id", "session_id", "reason", "policy_reason", "device", "message")
 
 
 class ResponseEngine:
-    """Decide when a record triggers the response plan, run it, and track the stream.
-
-    ``out`` receives each output record as soon as it exists, so the power action's
-    record is written before the machine goes down.
-    """
+    """Decide which records trigger a response, and run the plan."""
 
     def __init__(self, config, executor, out=emit, apply=False, clock=time.monotonic_ns):
         self.config = config
@@ -519,9 +487,7 @@ class ResponseEngine:
         if kind == "enforcement_skipped":
             return self.config.include_skipped and record.get("requested_action") == "block"
         if kind == "lsm_bridge_error":
-            # The step 6 bridge could not protect (or lost protection of) selected files on an
-            # allowed drive. Opt-in, because the drive itself was approved.
-            return self.config.include_lsm_errors
+            return self.config.include_lsm_errors  # opt-in: BPF-LSM protection failed
         return False
 
     def handle(self, record):
@@ -544,8 +510,8 @@ class ResponseEngine:
             self.fire(record)
 
     def fire(self, record):
-        """Run the whole plan for one triggering record, unless suppressed."""
-        # Upstream "reason" and "message" are renamed so they never collide with our own fields.
+        """Run the plan for one trigger, unless cooldown or a power-off suppresses it."""
+        # Keep upstream reason/message apart from our own fields.
         renamed = {"reason": "trigger_reason", "message": "trigger_message"}
         context = {renamed.get(name, name): record[name] for name in TRIGGER_FIELDS if name in record}
         context["trigger_type"] = record.get("type")
@@ -571,7 +537,7 @@ class ResponseEngine:
         failed = 0
         for action in self.config.actions:
             if action["type"] == "power" and self.apply:
-                # Write the record first: after this call the process may not get another chance.
+                # Log before powering off, in case nothing gets written after.
                 self.power_issued = True
                 self.out({"type": "response_action", "response_id": response_id, "action": "power",
                           "status": "issuing", "applied": True, "command": power_command(action),
@@ -583,7 +549,7 @@ class ResponseEngine:
             if not ok:
                 failed += 1
                 if action["type"] == "power":
-                    self.power_issued = False  # it did not happen, so later triggers may retry
+                    self.power_issued = False  # allow a retry
             self.out({"type": "response_action", "response_id": response_id, "action": action["type"],
                       "status": "ok" if ok else "failed", "applied": self.apply, "ok": ok,
                       "duration_ns": finished - started, "since_trigger_ns": finished - now,
@@ -594,7 +560,7 @@ class ResponseEngine:
                   "usb_id": context.get("usb_id")})
 
     def outcome(self, interrupted):
-        """Return (closing reason, ok). ok needs a clean stop, upstream ok, and no failures."""
+        """Return the closing reason and whether the run was ok."""
         if interrupted:
             reason, upstream_ok = "requested_stop", True
         elif self.upstream_close is not None:
@@ -606,7 +572,7 @@ class ResponseEngine:
 
 
 def process_stream(engine, stream):
-    """Handle each NDJSON line and end with a response_stream_closed record; return exit status."""
+    """Handle each input line, then report how the stream ended."""
     interrupted = False
     try:
         for line in stream:
@@ -628,7 +594,7 @@ def process_stream(engine, stream):
     return 0 if ok else 1
 
 
-# --- CLI -------------------------------------------------------------------------------
+# Command line
 
 def require_root():
     if sys.platform != "linux":
