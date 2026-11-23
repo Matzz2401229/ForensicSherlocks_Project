@@ -1,16 +1,13 @@
 # Step 3: USB monitoring component v1
 
-Copy the src/ and tests/ directories into the repository on Windows, commit on
-feature/usb-monitor, and push. Also copy this guide if useful. Keep the existing
-.gitattributes and .gitignore. The Ubuntu clone is at:
-/home/ryelle/df/project/portwatchman.
+This component uses real eBPF programs loaded by bpftrace and supervised by a
+Python 3 standard-library launcher. Monitoring requires no Python packages or native
+compilation. It observes events without changing USB authorisation or executing
+response actions. The verified backend version is recorded in the README.
 
-This component uses real eBPF programs loaded by bpftrace 0.20.2, supervised by
-a Python 3 standard-library launcher. No Python packages or compilation are
-required. A native libbpf loader can replace this backend later if required by
-your assessment; this implementation is deliberately based on the hooks you
-have already tested. It never changes USB authorisation, locks sessions, deletes
-files, or shuts down the VM.
+Commands use Bash in the Linux system under test. Start in your repository root;
+replace the path below with your clone's actual location. For dependencies and USB
+discovery, see [shared testing setup](TESTING-SETUP.md).
 
 ## Files
 
@@ -22,8 +19,8 @@ files, or shuts down the VM.
 ## Pull and check
 
 ```bash
-cd ~/df/project/portwatchman
-git pull --ff-only
+cd '/path/to/portwatchman'
+# If updating, check git status and the intended branch before pulling.
 python3 --version
 python3 -m unittest discover -s tests -p test_usb_monitor.py -v
 sudo python3 src/monitor/usb_monitor.py --check
@@ -83,12 +80,12 @@ loss or warning leaves degraded=true for the remainder of that session.
 
 ## Default-deny regression
 
-After confirming ordinary monitoring, repeat the earlier default-deny experiment
-on the confirmed test bus (previously bus 2): unmount, set authorized_default=0,
-reconnect, and confirm monitoring events still appear while authorized=0 and no
-USB block device appears. Restore the original authorized_default=1, confirm the
-device identity (058f:6387 at the expected path), and approve it again. Do not
-write blanket settings across every USB bus.
+After confirming ordinary monitoring, use the selected-device setup and default-deny
+procedure in [Step 5](STEP5-TESTING.md#slice-1-default-deny-a-bus). Keep the monitor
+running while reconnecting a device on the selected armed bus. Setup events should
+still appear while the device is unauthorised and its block device is absent.
+Restore the saved original defaults and confirm the current device identity before
+authorising it again. No lab-specific bus number or vendor/product pair is required.
 
 ## Event semantics and limits
 
@@ -120,8 +117,9 @@ write blanket settings across every USB bus.
 
 ## Completion evidence
 
-Keep step 3 in progress until the live script compiles/attaches, the three-cycle
-test produces correlated setup/disconnect records, default-deny still works,
-the saved stream parses as JSON, and stop/restart releases the backend normally.
-The Python tests have been run locally on Windows; kernel attachment and event
-behaviour still require your Ubuntu VM results.
+Step 3 is validated for the recorded Ubuntu VM environment: unit tests, live
+attachment, correlated setup/disconnect events, monitoring while default-deny is
+active, JSON capture and normal backend cleanup passed. For another environment,
+rerun these checks; a successful preflight alone does not prove attachment.
+
+Python-only checks on other operating systems do not validate Linux kernel attachment.
