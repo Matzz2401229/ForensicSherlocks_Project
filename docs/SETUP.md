@@ -98,7 +98,7 @@ sudo reboot
 
 ```bash
 sudo apt update
-sudo apt install -y git python3 bpftrace clang llvm build-essential libbpf-dev libelf-dev pkg-config
+sudo apt install -y git python3 bpftrace clang llvm linux-tools-common build-essential libbpf-dev libelf-dev libjson-c-dev pkg-config
 bpftrace --version     # expect v0.20.x
 python3 --version      # 3.10 or later
 ```
@@ -165,6 +165,7 @@ python3 -m unittest discover -s tests -p 'test_*.py' -v
 sudo python3 src/monitor/usb_monitor.py --check
 ```
 
-All tests should pass (176 at step 7). Work on a feature branch, for example
+All tests should pass (229 after steps 6 and 7; 8 native controller tests skip until
+the BPF controller is built with `bash src/enforcement/bpf/build.sh`, see step 6). Work on a feature branch, for example
 `git checkout -b feature/configurable-responses`, and merge into `main` through the
 team's usual review.

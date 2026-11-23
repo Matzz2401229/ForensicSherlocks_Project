@@ -139,6 +139,8 @@ class ConfigTests(Fixture):
         self.assert_rejected(self.document([{"type": "lock_session"}], trigger={"include_skipped": "yes"}),
                              "include_skipped")
         self.assert_rejected(self.document([{"type": "lock_session"}], trigger={"other": 1}), "Unknown trigger")
+        self.assert_rejected(self.document([{"type": "lock_session"}], trigger={"include_lsm_errors": 1}),
+                             "include_lsm_errors")
 
     def test_rejects_bad_actions(self):
         self.assert_rejected(self.document([{"type": "format_disk"}]), "unknown type")
@@ -416,6 +418,31 @@ class EngineTests(Fixture):
         engine.handle({"schema_version": 1, "type": "enforcement_skipped", "requested_action": "block",
                        "reason": "stale_decision", "usb_id": "2-1"})
         self.assertEqual(len(self.runner.calls), 1)
+
+    def test_lsm_bridge_errors_trigger_only_when_configured(self):
+        error = {"schema_version": 1, "type": "lsm_bridge_error", "usb_id": "4-1", "connection_id": "c9",
+                 "message": "controller lost", "protection_complete": False}
+        engine = self.engine([{"type": "lock_session"}])
+        engine.handle(error)
+        self.assertEqual(self.runner.calls, [])
+        self.records.clear()
+        engine = self.engine([{"type": "lock_session"}], trigger={"include_lsm_errors": True})
+        engine.handle(error)
+        self.assertEqual(self.runner.calls, [["loginctl", "lock-sessions"]])
+        triggered, = self.of_type("response_triggered")
+        self.assertEqual(triggered["trigger_type"], "lsm_bridge_error")
+        self.assertEqual(triggered["trigger_message"], "controller lost")
+        self.assertEqual(triggered["connection_id"], "c9")
+
+    def test_other_lsm_bridge_records_never_trigger(self):
+        engine = self.engine([{"type": "lock_session"}], cooldown_seconds=0,
+                             trigger={"include_lsm_errors": True, "include_skipped": True})
+        for kind in ("lsm_bridge_started", "lsm_bridge_pending", "lsm_bridge_registered",
+                     "lsm_bridge_plan", "lsm_bridge_released", "lsm_bridge_disconnected",
+                     "lsm_bridge_prepared_for_removal", "lsm_bridge_retained", "lsm_bridge_revoke_result"):
+            engine.handle({"schema_version": 1, "type": kind, "usb_id": "4-1"})
+        self.assertEqual(self.runner.calls, [])
+        self.assertEqual(engine.input_errors, 0)
 
     def test_cooldown_suppresses_repeat_triggers(self):
         clock = FakeClock()

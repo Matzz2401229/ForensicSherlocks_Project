@@ -17,6 +17,8 @@ Design notes:
 - Deletion is confined to ``allowed_roots`` (and, for ``sanitise``, the listed home
   directories). Paths are checked when the config loads and again, with symlinks
   resolved, just before each deletion. Symlinks are removed, never followed.
+- Triggers: a blocked device; optionally a skipped block decision (``include_skipped``)
+  or a step 6 BPF-LSM bridge error on an allowed drive (``include_lsm_errors``).
 - A cooldown stops a device that keeps reconnecting from re-running the plan, and once
   a power action has been issued every later trigger is suppressed.
 - The proc root and command runner are injectable so the logic is unit-testable.
@@ -116,6 +118,7 @@ class Config:
     actions: list
     cooldown_seconds: float = 30.0
     include_skipped: bool = False
+    include_lsm_errors: bool = False
     allowed_roots: tuple = ()
     path: Path | None = None
     summary: dict = field(default_factory=dict)
@@ -186,10 +189,13 @@ def validate_document(document, path=None):
     trigger = document.get("trigger", {})
     if not isinstance(trigger, dict):
         raise ResponseError("trigger must be an object")
-    _check_keys(trigger, ("include_skipped",), "trigger")
+    _check_keys(trigger, ("include_skipped", "include_lsm_errors"), "trigger")
     include_skipped = trigger.get("include_skipped", False)
     if type(include_skipped) is not bool:
         raise ResponseError("trigger.include_skipped must be true or false")
+    include_lsm_errors = trigger.get("include_lsm_errors", False)
+    if type(include_lsm_errors) is not bool:
+        raise ResponseError("trigger.include_lsm_errors must be true or false")
 
     cooldown = document.get("cooldown_seconds", 30)
     if type(cooldown) not in (int, float) or not 0 <= cooldown <= 86400:
@@ -212,8 +218,9 @@ def validate_document(document, path=None):
         raise ResponseError("power must be the last action, because nothing runs after it")
 
     summary = {"actions": kinds, "cooldown_seconds": cooldown, "include_skipped": include_skipped,
+               "include_lsm_errors": include_lsm_errors,
                "allowed_roots": [str(root) for root in roots]}
-    return Config(normalised, float(cooldown), include_skipped, roots, path, summary)
+    return Config(normalised, float(cooldown), include_skipped, include_lsm_errors, roots, path, summary)
 
 
 def load_config(path):
@@ -481,7 +488,7 @@ class ActionRunner:
 
 # --- Pipeline stage --------------------------------------------------------------------
 
-TRIGGER_FIELDS = ("usb_id", "connection_id", "session_id", "reason", "policy_reason", "device")
+TRIGGER_FIELDS = ("usb_id", "connection_id", "session_id", "reason", "policy_reason", "device", "message")
 
 
 class ResponseEngine:
@@ -511,6 +518,10 @@ class ResponseEngine:
             return record.get("action") == "block"
         if kind == "enforcement_skipped":
             return self.config.include_skipped and record.get("requested_action") == "block"
+        if kind == "lsm_bridge_error":
+            # The step 6 bridge could not protect (or lost protection of) selected files on an
+            # allowed drive. Opt-in, because the drive itself was approved.
+            return self.config.include_lsm_errors
         return False
 
     def handle(self, record):
@@ -534,9 +545,9 @@ class ResponseEngine:
 
     def fire(self, record):
         """Run the whole plan for one triggering record, unless suppressed."""
-        # The upstream "reason" becomes trigger_reason so it never collides with our own.
-        context = {("trigger_reason" if name == "reason" else name): record[name]
-                   for name in TRIGGER_FIELDS if name in record}
+        # Upstream "reason" and "message" are renamed so they never collide with our own fields.
+        renamed = {"reason": "trigger_reason", "message": "trigger_message"}
+        context = {renamed.get(name, name): record[name] for name in TRIGGER_FIELDS if name in record}
         context["trigger_type"] = record.get("type")
         now = self.clock()
         if self.power_issued:

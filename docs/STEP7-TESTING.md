@@ -66,6 +66,21 @@ Rules enforced when the config loads:
 - `trigger.include_skipped`: also respond to `enforcement_skipped` records whose policy
   decision was `block` (for example a stale decision, or a device removed while it was
   being processed). Off by default.
+- `trigger.include_lsm_errors`: also respond to a step 6 `lsm_bridge_error`, which means
+  selected-file protection on an **allowed** drive failed or was lost (for example the
+  BPF-LSM controller stopped). Off by default. Other `lsm_bridge_*` records are ignored.
+
+## Working with step 6 (BPF-LSM)
+
+The response stage reads whatever the enforcement stage prints, so it works the same with
+or without `enforce --lsm-config`. Two things to know:
+
+- Do not list a file that the BPF-LSM guard protects in `delete.paths`. The guard denies
+  every open of that file, including the overwrite, so the delete reports `EACCES` in
+  `errors` and the file stays on the drive. The remaining actions, including power, still run.
+- With `include_lsm_errors` on, the step 6 controller-loss test (STEP6-TESTING, "Deliberate
+  controller-loss test") becomes a response test too: stopping the controller produces
+  `lsm_bridge_error`, which then runs the response plan.
 
 ## Unit tests
 
@@ -75,7 +90,8 @@ git pull --ff-only
 python3 -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-Expect `OK` (176 tests; 46 are in `tests/test_responses.py`). They use temporary
+Expect `OK` (229 tests, 8 skipped until the BPF controller is built; 48 are in
+`tests/test_responses.py`). They use temporary
 directories, a fake `/proc` and a fake command runner, so they need no root, run no
 commands, and never lock, delete outside the fixture, or power off. On Windows the
 response tests are skipped, because the actions only exist on Linux.
