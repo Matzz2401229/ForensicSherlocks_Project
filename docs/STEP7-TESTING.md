@@ -1,9 +1,31 @@
 # Step 7: configurable responses
 
-Status: fixes prepared on the integration branch; runtime verification is pending.
-Project code, unit tests and live responses were not executed while preparing this
-revision. The combined tree declares 251 unit-test methods; report the actual run
-count, skips and result from the target Ubuntu VM before accepting this milestone.
+Status: Step 7 component verification completed in the recorded Ubuntu 24.04
+VMware environment with kernel `7.0.0-38-generic`. The operator ran all **251 unit
+tests** successfully and performed the manual checks summarised below. These are
+recorded results for that environment; another environment must repeat verification.
+
+## Recorded verification
+
+| Check | Recorded result |
+| --- | --- |
+| Combined unit suite | 251 tests, `OK`; includes containment, freshness/context, duplicate and failure/interrupt regressions. |
+| Manual lock | Dry-run preview passed; applied action visibly locked the desktop. |
+| USB rejection | Serial mismatch kept the device unauthorised and absent from block-device inventory; preview did not lock, applied response visibly locked once. |
+| USB approval | Device authorised while the bus default remained deny; applied response stage closed with zero responses and no errors. |
+| Step 6/7 approval integration | Selected-file registration completed; opening the target was denied, controls stayed readable and the denial counter increased. No response was triggered. Stopping the pipeline released the target. |
+| Step 6/7 rejection integration | USB stayed blocked, one lock occurred, and the controller retained no targets and zero failures. |
+| Cleanup | Pipelines stopped, controller/backend processes exited and original bus defaults were restored. |
+| Isolated deletion | Two files/two directories removed with one overwrite pass; control unchanged; no errors or retained directory. |
+| Isolated sanitisation | Nine selected trace files removed; three controls unchanged; no retained directory. Separate cache-only action reported `drop_caches: done`. |
+| Graceful poweroff | Poweroff-only manual action succeeded; guest fully powered off and was started manually in VMware. Boot ID changed and the running kernel stayed unchanged. |
+
+USB-triggered locking was tested end to end. Deletion, sanitisation/cache dropping
+and graceful poweroff were exercised separately through `run-action`; an applied
+USB-triggered sequence combining every action was not manually tested. Reboot,
+force and immediate/SysRq power modes retain unit coverage only. Filesystem checks
+establish logical removal and selection boundaries, not forensic unrecoverability
+or RAM erasure. Overall service integration and evaluation remain later milestones.
 
 ## Scope and prerequisites
 
@@ -213,14 +235,24 @@ Use a snapshot and a console recovery path. Do not combine power with unreviewed
 deletion/sanitisation paths for an initial live test. Command acceptance is not
 proof of completed shutdown; record the observed VM behaviour and latency.
 
+The recorded graceful-poweroff run waited for an unattended upgrade during
+shutdown. Allow such updates to finish. The approximately 59 ms action duration
+measured the command call, not the time until the guest powered off. After the
+guest fully powered off, manual startup and a different boot ID confirmed a new
+boot session. Use observed power state as evidence; a successful command alone
+does not establish completed or immediate shutdown.
+
 ## Completion evidence
 
-- [ ] Combined Step 6/7 unit suite passes on the target VM.
-- [ ] Dry-run/live lock, allow and rejection paths produce the expected records.
-- [ ] Replay/context rejection and upstream failure/interrupt regressions pass.
-- [ ] Any enabled deletion/sanitisation extension passes its isolated-fixture tests.
-- [ ] Configured power mode is manually observed in an isolated VM.
-- [ ] Step 6 integration and original bus defaults remain correct after cleanup.
+The recorded VM run satisfies the following component checks; rerun them for a
+different environment or relevant source change.
+
+- [x] Combined Step 6/7 unit suite passes on the target VM (251 tests).
+- [x] Dry-run/live lock, allow and rejection paths produce the expected records.
+- [x] Freshness/context rejection, duplicate suppression and failure/interrupt regressions pass in the unit suite.
+- [x] Deletion and sanitisation pass their isolated-fixture tests; cache dropping succeeds separately.
+- [x] Configured `poweroff` / `graceful` mode is manually observed in an isolated VM.
+- [x] Step 6 integration and original bus defaults remain correct after cleanup.
 
 Do not mark Step 7 complete based on source review or a declared test count alone.
 Service installation, durable logs, worker supervision and full-system evaluation

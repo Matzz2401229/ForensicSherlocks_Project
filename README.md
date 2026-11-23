@@ -4,7 +4,7 @@ PortWatchman is a Linux USB monitoring, allowlisting, and enforcement project de
 
 The intended behaviour is to keep newly connected USB devices blocked until their reported attributes satisfy the allowlist. Unapproved devices remain blocked and can trigger a configured response, such as session locking or shutdown.
 
-**Current implementation:** USB monitoring, device identification/allowlist decisions, and USB access control are implemented and tested. Access control sets default-deny on managed USB buses, authorises allowed devices after re-validating them, keeps unapproved devices blocked, and reconciles devices connected before it started. Supplementary selected-file BPF-LSM enforcement, its root-only Unix socket and opt-in Python bridge are implemented and verified in the recorded Ubuntu VM environment, including coordinated USB removal/reconnection and report-only failure handling. Service orchestration remains planned. Step 7 response code and regression fixes are prepared, pending Ubuntu verification. The policy watcher on its own still reports `enforcement_applied: false`; device access changes only when its decisions are piped into the enforcement stage.
+**Current implementation:** USB monitoring, device identification/allowlist decisions, and USB access control are implemented and tested. Access control sets default-deny on managed USB buses, authorises allowed devices after re-validating them, keeps unapproved devices blocked, and reconciles devices connected before it started. Supplementary selected-file BPF-LSM enforcement, its root-only Unix socket and opt-in Python bridge are implemented and verified in the recorded Ubuntu VM environment, including coordinated USB removal/reconnection and report-only failure handling. Service orchestration remains planned. Step 7 passed 251 unit tests and the manual Ubuntu VM checks recorded below, covering USB-triggered locking, bridge integration, isolated file/trace cleanup and graceful guest poweroff. The policy watcher on its own still reports `enforcement_applied: false`; device access changes only when its decisions are piped into the enforcement stage.
 
 ## Architecture
 
@@ -292,7 +292,7 @@ Follow the [Step 6 guide](docs/STEP6-TESTING.md) for normal shutdown, coordinate
 removal, reconnect, failure testing and restoring the saved bus defaults. The bridge
 does not register files for direct `authorize` or `reconcile` calls.
 
-### Configurable responses (Step 7 — verification pending)
+### Configurable responses (Step 7)
 
 The optional fourth stage reads fresh enforcement output and runs the configured
 ordered response plan for an unapproved USB connection. The default plan only
@@ -317,10 +317,12 @@ is best effort, refuses symlink roots/parents, nested mounts and multiple hard l
 and can retain incomplete operations in a private recovery directory. It is not a
 guarantee of forensic erasure; dropping caches does not sanitise RAM.
 
-See [Step 7 testing](docs/STEP7-TESTING.md) for the current fixes, input contract,
-isolation procedure, limitations and manual Ubuntu verification. No Step 7 unit or
-live response tests have been run for this revision. The combined tree currently
-declares 251 test methods; the completed Step 6 record remains 181 passing tests.
+Step 7 passed all **251 unit tests** in the Ubuntu VM. Live tests verified
+USB-triggered session locking and approval without a response, with and without
+the Step 6 bridge. Separate fixture tests verified selected-file deletion, selected
+trace cleanup and cache dropping; graceful guest poweroff was manually observed.
+See [Step 7 testing](docs/STEP7-TESTING.md) for the evidence, input contract and limits.
+Force, immediate/SysRq and reboot modes have unit coverage but were not tested live.
 
 ## Allowlist configuration
 
@@ -443,6 +445,10 @@ At the Step 5 milestone, **130 tests** passed, including regression checks for t
 
 The completed Step 6 revision passed **181 tests** in Ubuntu, including native CLI safety checks and Python socket/bridge/resolver tests. Live tests also verified safe removal/reconnection, rejection with the bridge enabled, normal cleanup and controller-loss reporting under `on_error: report`. Native tests require a compiled Linux controller; the separate root-only runner exercises kernel enforcement and socket authentication. The bridge is disabled unless `enforce --lsm-config FILE` is supplied; registration failure handling is an explicit configuration choice. See [step 6 testing](docs/STEP6-TESTING.md) for staged verification and the post-authorisation registration window.
 
+Step 7 passed **251 tests** in Ubuntu, including response containment, freshness/correlation, duplicate suppression and failure/interrupt regression checks. Live approval and rejection tests passed with the response stage applied and the Step 6 bridge both disabled and enabled. Approved devices received selected-file protection with no response; rejected devices stayed blocked and triggered a single lock without LSM registration. Restriction release, controller health, backend cleanup and restoration of bus defaults were verified.
+
+Separate disposable local-filesystem fixtures verified deletion of two selected files with an unchanged control, and sanitisation of nine trace files with three unchanged controls. Cache dropping completed successfully. Graceful poweroff was observed in VMware, followed by manual startup and a changed boot ID; an unattended upgrade delayed shutdown. The response's command duration is not total poweroff latency. See [Step 7 evidence](docs/STEP7-TESTING.md#recorded-verification) for tested limits.
+
 See [step 3 testing](docs/STEP3-TESTING.md), [step 4 testing](docs/STEP4-TESTING.md), and [step 5 testing](docs/STEP5-TESTING.md) for detailed procedures. Treat device IDs in those guides as examples and rediscover the current topology before testing.
 
 ## Implementation progress
@@ -453,7 +459,7 @@ See [step 3 testing](docs/STEP3-TESTING.md), [step 4 testing](docs/STEP4-TESTING
 - [x] 4. Implement device identification and allowlisting.
 - [x] 5. Implement automatic USB access control.
 - [x] 6. Implement supplementary BPF-LSM enforcement.
-- [ ] 7. Implement configurable responses.
+- [x] 7. Implement configurable responses (tested Ubuntu VM scope).
 - [ ] 8. Integrate components into a running service.
 - [ ] 9. Handle failures, recovery, and edge cases.
 - [ ] 10. Test and evaluate the complete solution.
@@ -468,5 +474,5 @@ See [step 3 testing](docs/STEP3-TESTING.md), [step 4 testing](docs/STEP4-TESTING
 - Vendor/product IDs and serial numbers are device-reported attributes and can be spoofed. A policy match does not authenticate physical identity.
 - The watcher processes new setup events; `reconcile` handles devices connected before startup and must currently be run by hand. Running it automatically on service start and after recovery remains planned.
 - Current JSON output supports development testing; durable audit logging and service supervision remain planned.
-- Step 7 session-lock/power requests and best-effort file/trace cleanup are implemented but awaiting target-VM verification. Reliable evidence erasure, RAM sanitisation and removal of host/snapshot copies are not established capabilities.
+- Step 7 session locking is verified through the live USB pipeline; best-effort file/trace cleanup and graceful poweroff were tested separately. An applied USB-triggered sequence combining every action was not manually tested. Force, immediate/SysRq and reboot modes remain unit-tested only. Reliable evidence erasure, RAM sanitisation and removal of host/snapshot copies are not established capabilities.
 - Timing measurements inside VMware describe guest behaviour. They do not establish physical insertion latency or erase data retained by the Windows host or VM snapshots.
