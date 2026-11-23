@@ -4,46 +4,46 @@ This component writes USB authorisation state in sysfs: the per-bus
 `authorized_default` flag and the per-device `authorized` flag. It is the first
 component that changes device access; steps 3 and 4 only observed and decided.
 
-All write commands **default to a dry run** and change nothing until you add
-`--apply`. Writes to sysfs require root, so the live `--apply` commands use `sudo`.
+`arm`, `restore`, `authorize`, `revoke` and `reconcile` are dry runs unless
+`--apply` is supplied. **`enforce` writes by default; use `enforce --dry-run` to
+prevent its writes.** Live sysfs writes require root.
 
-> **Safety.** These commands affect USB devices **inside the Ubuntu VM only**. The
-> sysfs paths they touch do not exist on, and have no write path to, the Windows
-> host, so they cannot block host devices, shut down the host, or affect host data.
-> `arm --apply` sets default-deny on every managed bus. Devices already connected
-> keep working (the flag only gates *newly* connected devices), but after arming, a
-> newly plugged or replugged device - including a USB mouse or keyboard passed
-> through to the VM - starts blocked until it is authorised. `restore --apply` undoes
-> default-deny. Keep a non-USB way to control the VM (VMware console) during testing.
+Commands affect the Linux system running them. Inside a VM, they control devices
+connected to that guest; they do not change the Windows host's USB authorisation
+settings. `arm --apply` gates newly connected devices on the managed buses; already
+connected devices retain their access. Keep a working way to control the system
+while testing. Unmount a test filesystem before revoking or disconnecting its drive.
 
-Config: `config/enforcement.json` sets `managed_buses` (`"auto"` arms every bus) and
-the state file. The allowlist policy is the step 4 file; the example
-`config/allowlist.example.json` matches the lab drive `058f:6387`.
+Complete [shared testing setup](TESTING-SETUP.md) first. It selects your actual
+`USB_ID`, creates a matching policy in `logs/test-allow.json` and scopes
+`logs/test-enforcement.json` to that drive's inspected bus. Every bus-level command
+below uses that same config and its saved original state. Stop any Step 6 controller
+before these independent tests, or follow its coordinated-removal procedure first.
 
 ## Pull and run the unit tests
 
 ```bash
-cd ~/df/project/portwatchman
-git pull --ff-only
+cd '/path/to/portwatchman'
+# Check git status and the intended branch before updating your clone.
 python3 -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
 Expect `OK`. The enforcement tests use a fake sysfs tree and need no root or USB drive.
 
-## Slice 1: default-deny a bus (arm / restore / status)
+## Slice 1: default-deny a bus
 
 Look first, write nothing:
 
 ```bash
-python3 src/enforcement/usb_authorization.py status
-python3 src/enforcement/usb_authorization.py arm          # dry run: prints the plan
+python3 src/enforcement/usb_authorization.py --config logs/test-enforcement.json status
+python3 src/enforcement/usb_authorization.py --config logs/test-enforcement.json arm          # dry run: prints the plan
 ```
 
 `status` lists each bus and its `authorized_default`; `arm` reports the buses it
 would set to `0`. Now apply default-deny, with the test flash drive unplugged:
 
 ```bash
-sudo python3 src/enforcement/usb_authorization.py arm --apply
+sudo python3 src/enforcement/usb_authorization.py --config logs/test-enforcement.json arm --apply
 ```
 
 Plug in the test drive, then confirm it does **not** appear:
@@ -55,7 +55,7 @@ lsblk -o NAME,TRAN,SIZE,FSTYPE,MOUNTPOINTS
 The drive should be absent (blocked by default-deny). Restore when done:
 
 ```bash
-sudo python3 src/enforcement/usb_authorization.py restore --apply
+sudo python3 src/enforcement/usb_authorization.py --config logs/test-enforcement.json restore --apply
 ```
 
 `restore` only changes the default for devices connected from now on. A drive that was
@@ -64,38 +64,48 @@ blocked while armed stays blocked: replug it, or authorise it (slice 2), and it 
 
 ## Slice 2: authorise or revoke one device
 
-With the drive connected, find its USB ID (step 4's `list`/`inspect`), e.g. `2-1`.
-Dry run first, then apply using the example policy that lists the lab drive:
+With the drive connected, confirm its current `USB_ID` using `list`/`inspect`.
+Dry run first, then apply using your generated matching policy:
 
 ```bash
-python3 src/enforcement/usb_authorization.py --policy config/allowlist.example.json authorize 2-1
-sudo python3 src/enforcement/usb_authorization.py --policy config/allowlist.example.json authorize 2-1 --apply
-cat /sys/bus/usb/devices/2-1/authorized        # 1
+python3 src/enforcement/usb_authorization.py --config logs/test-enforcement.json --policy logs/test-allow.json authorize "$USB_ID"
+sudo python3 src/enforcement/usb_authorization.py --config logs/test-enforcement.json --policy logs/test-allow.json authorize "$USB_ID" --apply
+cat "/sys/bus/usb/devices/$USB_ID/authorized"        # 1
 ```
 
 The command binds to the device instance first, then re-reads the device and re-checks the
 policy, and writes only to that same instance. A device whose attributes no longer match,
 or that the policy no longer allows, stays blocked (`action: block`). If the device is
 unplugged or replaced at the same port during the command, nothing is written and the
-command reports `device_unavailable` or `device_changed`. Revoke to block it again:
+command reports `device_unavailable` or `device_changed`. If the filesystem mounted
+after authorisation, identify its current partition and unmount it before revoking:
 
 ```bash
-sudo python3 src/enforcement/usb_authorization.py revoke 2-1 --apply
-cat /sys/bus/usb/devices/2-1/authorized        # 0
+lsblk -o NAME,TRAN,SIZE,FSTYPE,MOUNTPOINTS
+udisksctl unmount -b "$USB_PARTITION"
+```
+
+Then revoke to block it again:
+
+```bash
+sudo python3 src/enforcement/usb_authorization.py --config logs/test-enforcement.json revoke "$USB_ID" --apply
+cat "/sys/bus/usb/devices/$USB_ID/authorized"        # 0
 ```
 
 ## Slice 3: the live enforcement pipeline
 
-Arm default-deny first (slice 1), with the drive unplugged. Then run the full
+Arm default-deny first (slice 1), with the drive unplugged. Then run the USB-authorisation
 pipeline - monitor detects, policy decides, enforce acts:
 
 ```bash
+set -o pipefail
+sudo -v
 sudo python3 src/monitor/usb_monitor.py |
-  python3 src/policy/device_policy.py --policy config/allowlist.example.json watch |
-  sudo python3 src/enforcement/usb_authorization.py --policy config/allowlist.example.json enforce
+  python3 src/policy/device_policy.py --policy logs/test-allow.json watch |
+  sudo python3 src/enforcement/usb_authorization.py --config logs/test-enforcement.json --policy logs/test-allow.json enforce
 ```
 
-`enforce` reads `config/enforcement.json` and acts only on devices on the managed buses.
+`enforce` reads the selected `logs/test-enforcement.json` and acts only on devices on the managed buses.
 It prints `enforcement_started` immediately, listing `managed_buses` and any
 `unarmed_buses` (managed buses not set to default-deny; this should be empty after `arm`).
 Then it prints an `enforcement_monitor_status` record when the monitor's health changes.
@@ -105,9 +115,9 @@ before the monitor is healthy gets a `block` decision (the step 4 safety rule), 
 authorisation.
 
 Expect an `enforcement_result` with `action: allow`, `enforcement_applied: true`,
-`policy_reason: allowlist_match` and an `enforcement_latency_ns` (insertion to
-authorisation). Confirm the drive now appears in `lsblk`. To test the unlisted case, run
-the same pipeline without `--policy` (the default policy has no rules): the result is
+`policy_reason: allowlist_match` and an `enforcement_latency_ns` (from the
+referenced guest USB event to the enforcement result, not physical insertion time). Confirm the drive now appears in `lsblk`. To test the unlisted case, run
+the same pipeline with `--policy logs/test-deny.json` on both stages: the result is
 `action: block`, `reason: already_blocked`, `policy_reason: no_matching_allowlist_rule`,
 and the drive stays absent from `lsblk`.
 
@@ -140,20 +150,20 @@ Add `--dry-run` to the enforce command to see decisions acted on without writing
 ### Check: a removed device cannot receive a write (Linux)
 
 Instance binding relies on Linux refusing writes through a sysfs file that was opened
-before its device was removed. To confirm this on the VM, with the drive connected and
-its USB ID known (for example `4-1`):
+before its device was removed. With the test filesystem unmounted and the drive
+still connected, confirm its current `USB_ID`:
 
 ```bash
 sudo python3 -c '
 import errno, sys
 path = "/sys/bus/usb/devices/" + sys.argv[1] + "/authorized"
-held = open(path, "r+b")
-input("Holding " + path + ". Disconnect the drive in VMware, then press Enter...")
+held = open(path, "r+b", buffering=0)
+input("Holding " + path + ". Disconnect the selected test drive, then press Enter...")
 try:
     held.write(b"1\n"); held.flush(); print("UNEXPECTED: write accepted")
 except OSError as error:
     print("Refused as expected:", errno.errorcode.get(error.errno, error.errno))
-' 4-1
+' "$USB_ID"
 ```
 
 Expected: `Refused as expected: ENODEV` (or another refusal), never `write accepted`.
@@ -164,8 +174,8 @@ Arm default-deny, then connect the drive **before** starting any monitor, so it 
 present while nothing was watching. Reconcile sweeps the managed buses:
 
 ```bash
-python3 src/enforcement/usb_authorization.py --policy config/allowlist.example.json reconcile
-sudo python3 src/enforcement/usb_authorization.py --policy config/allowlist.example.json reconcile --apply
+python3 src/enforcement/usb_authorization.py --config logs/test-enforcement.json --policy logs/test-allow.json reconcile
+sudo python3 src/enforcement/usb_authorization.py --config logs/test-enforcement.json --policy logs/test-allow.json reconcile --apply
 ```
 
 Expect the allowed drive to be authorised (`action: allow`, `enforcement_applied: true`)
@@ -178,15 +188,15 @@ mistaken for a device that was blocked. The policy's own reason is in `policy_re
 ## Clean up
 
 ```bash
-sudo python3 src/enforcement/usb_authorization.py restore --apply
-cat /sys/bus/usb/devices/usb2/authorized_default   # back to the original (usually 1)
+sudo python3 src/enforcement/usb_authorization.py --config logs/test-enforcement.json restore --apply
+python3 src/enforcement/usb_authorization.py --config logs/test-enforcement.json status
 ```
 
 ## Limits
 
 - Writing `authorized`/`authorized_default` enforces whole-device access. Per-interface
   authorisation (composite or BadUSB-style devices that re-register as another type) is
-  out of scope for step 5 and belongs with the BPF-LSM layer (step 6).
+  not implemented in either Step 5 or the selected-file BPF-LSM guard in Step 6.
 - Vendor/product IDs and serials are device-reported and can be spoofed. Writes are bound to
   the device instance that was validated, so a replacement at the same port cannot inherit
   an approval, but a device that copies an allowlisted identity is still accepted.
@@ -194,3 +204,10 @@ cat /sys/bus/usb/devices/usb2/authorized_default   # back to the original (usual
   `enforce` and `reconcile` are limited to the managed buses.
 - The anti-forensic *response* to a blocked device (lock, shutdown) is step 7; this
   component only emits `enforcement_result` records for it to consume.
+
+## Validation record
+
+Step 5 is validated for the recorded Ubuntu VM environment: unit tests, live
+authorise/revoke, allow/block pipeline behaviour, reconciliation, removed-device
+write refusal and restoration passed. A new environment should rerun this guide.
+The selected-file bridge is covered separately by [Step 6](STEP6-TESTING.md).

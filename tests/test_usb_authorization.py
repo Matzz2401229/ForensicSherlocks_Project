@@ -702,6 +702,9 @@ class ReviewRegressionTests(Fixture):
         stdin = io.StringIO(json.dumps(record) + "\n" + json.dumps(stop) + "\n")
         out = io.StringIO()
         with mock.patch.object(usb_authorization, "require_linux"), \
+                mock.patch.object(usb_authorization, "response_stream_context", return_value={
+                    "boot_id": "11111111-1111-4111-8111-111111111111",
+                    "enforcement_instance_id": "test-producer", "enforcement_apply": True}), \
                 mock.patch.object(sys, "stdin", stdin), contextlib.redirect_stdout(out):
             code = main(["--config", str(config), "--usb-root", str(self.sysfs),
                          "--policy", str(self.block_policy()), "enforce"])

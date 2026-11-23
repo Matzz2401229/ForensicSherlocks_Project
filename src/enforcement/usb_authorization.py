@@ -29,6 +29,7 @@ import re
 import sys
 import tempfile
 import time
+import uuid
 
 SCHEMA_VERSION = 1
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -633,7 +634,22 @@ def reconcile(controller, bus_manager, policy_path, apply=True):
             "buses": buses, "failures": failures, "devices": results}
 
 
-def process_stream(enforcer, stream):
+def response_stream_context(apply):
+    """Identify one live producer; response consumers must reject old/replayed streams."""
+    try:
+        boot_id = str(uuid.UUID(Path("/proc/sys/kernel/random/boot_id").read_text().strip()))
+    except (OSError, ValueError) as error:
+        raise EnforcementError(f"Cannot establish response-stream boot identity: {error}") from error
+    return {"boot_id": boot_id, "enforcement_instance_id": str(uuid.uuid4()), "enforcement_apply": apply}
+
+
+def response_record(record, context):
+    if context is None:
+        return record
+    return {**record, **context, "clock": "monotonic", "emitted_timestamp_ns": time.monotonic_ns()}
+
+
+def process_stream(enforcer, stream, bridge=None, response_context=None):
     """Enforce each NDJSON line from ``stream`` and end with an enforcement_stream_closed record.
 
     Returns 0 only for a deliberate stop (Ctrl+C here or upstream) or a clean upstream
@@ -641,26 +657,41 @@ def process_stream(enforcer, stream):
     is visible to whatever runs this stage.
     """
     interrupted = False
+    def send(record):
+        emit(response_record(record, response_context))
     try:
         for line in stream:
             if not line.strip():
                 continue
+            incoming = None
             try:
-                record = enforcer.handle(_parse_json(line, "decision stream"))
+                incoming = _parse_json(line, "decision stream")
+                record = enforcer.handle(incoming)
             except EnforcementError as error:  # only unparseable input reaches here
                 enforcer.input_errors += 1
                 record = {"type": "enforcement_input_error", "message": str(error)}
             if record is not None:
-                emit(record)
+                send(record)
+            if bridge is not None:
+                if isinstance(incoming, dict):
+                    for event in bridge.handle(incoming, record):
+                        send(event)
+                for event in bridge.tick():
+                    send(event)
     except KeyboardInterrupt:
         interrupted = True  # Ctrl+C is a deliberate stop, not an error
     reason, ok = enforcer.outcome(interrupted)
-    emit({"type": "enforcement_stream_closed", "reason": reason, "ok": ok,
+    if bridge is not None:
+        for event in bridge.close(clean=ok):
+            send(event)
+        enforcer.failures += bridge.failures
+        reason, ok = enforcer.outcome(interrupted)
+    send({"type": "enforcement_stream_closed", "reason": reason, "ok": ok,
           "failures": enforcer.failures, "input_errors": enforcer.input_errors})
     return 0 if ok else 1
 
 
-def enforce(controller, bus_manager, policy_path, apply=True):
+def enforce(controller, bus_manager, policy_path, apply=True, lsm_config=None):
     """Read policy decisions as NDJSON on stdin and enforce each one on the managed buses."""
     require_linux()
     if sys.stdin.isatty():
@@ -670,9 +701,28 @@ def enforce(controller, bus_manager, policy_path, apply=True):
     # Enforcement relies on default-deny to keep new devices blocked; flag any bus not armed.
     unarmed = [bus for bus in buses if bus_manager.read_default(bus) != "0"]
     enforcer = DeviceEnforcer(controller, policy_path, apply=apply, managed_buses=buses)
-    emit({"type": "enforcement_started", "apply": apply, "policy_revision": policy.revision,
-          "managed_buses": buses, "unarmed_buses": unarmed})
-    return process_stream(enforcer, sys.stdin)
+    response_context = response_stream_context(apply)
+    bridge = None
+    if lsm_config is not None:
+        # Explicit opt-in only. Controller preflight happens before any USB authorisation.
+        from lsm_bridge import LsmBridge, load_bridge_config
+        try:
+            bridge_config = load_bridge_config(lsm_config)
+            unknown_rules = set(bridge_config.rules) - {rule["name"] for rule in policy.document["allowlist"]}
+            if unknown_rules:
+                raise EnforcementError(f"LSM config names missing allowlist rules: {sorted(unknown_rules)}")
+            if apply and unarmed:
+                raise EnforcementError("Arm every managed bus before enabling the live LSM bridge")
+            bridge = LsmBridge(bridge_config, controller.reader,
+                               enforcer._ensure_blocked, apply=apply)
+            bridge_started = bridge.start()
+        except Exception as error:
+            raise EnforcementError(f"BPF-LSM bridge startup failed: {error}") from error
+    emit(response_record({"type": "enforcement_started", "apply": apply, "policy_revision": policy.revision,
+                          "managed_buses": buses, "unarmed_buses": unarmed}, response_context))
+    if bridge is not None:
+        emit(response_record(bridge_started, response_context))
+    return process_stream(enforcer, sys.stdin, bridge=bridge, response_context=response_context)
 
 
 def make_parser():
@@ -701,6 +751,8 @@ def make_parser():
     reconcile_parser.add_argument("--apply", action="store_true", help="Actually write; otherwise dry run")
     enforce_parser = sub.add_parser("enforce", help="Read policy decisions on stdin and enforce them")
     enforce_parser.add_argument("--dry-run", action="store_true", help="Decide and report without writing")
+    enforce_parser.add_argument("--lsm-config", type=Path,
+                               help="Opt in to the selected-file BPF-LSM bridge with explicit error policy")
     return parser
 
 
@@ -730,7 +782,8 @@ def main(argv=None):
                 emit(result)
                 return 1 if result["failures"] else 0
             else:
-                return enforce(controller, manager, args.policy, apply=not args.dry_run)
+                return enforce(controller, manager, args.policy, apply=not args.dry_run,
+                               lsm_config=args.lsm_config)
         return 0
     except BrokenPipeError:
         sys.stdout = open(os.devnull, "w")

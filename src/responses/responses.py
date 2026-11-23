@@ -4,43 +4,49 @@
 Reads the enforcement stage's NDJSON on stdin and, for each blocked device, runs the
 ordered actions in ``config/responses.json``:
 - ``lock_session``: lock every graphical session through systemd-logind.
-- ``delete``: overwrite, truncate, rename and unlink configured files or directories.
+- ``delete``: descriptor-relative best-effort overwrite/removal of selected files or trees.
 - ``sanitise``: delete common user activity traces (recent files, thumbnails, shell
   history, trash) and drop the kernel page cache.
 - ``power``: power off or reboot, gracefully, forced, or immediately via sysrq.
 
 Design notes:
 - Every command is a dry run unless ``--apply`` is given, because these actions are
-  destructive. A dry run reports exactly what would be locked, deleted or powered off.
+  destructive. A dry run previews the plan and current filesystem snapshot.
 - Actions run in the configured order. ``power`` must be last, because nothing runs
   after it; a failed action is reported and the remaining actions still run.
 - Deletion is confined to ``allowed_roots`` (and, for ``sanitise``, the listed home
-  directories). Paths are checked when the config loads and again, with symlinks
-  resolved, just before each deletion. Symlinks are removed, never followed.
-- A cooldown stops a device that keeps reconnecting from re-running the plan, and once
+  directories). Roots and parent paths must not use symlink aliases; nested mounts
+  and multiply linked files are refused. Private capture and directory descriptors
+  prevent parent-path swaps from redirecting overwrites. Failures retain recoverable entries.
+- Watch accepts fresh boot/producer/session-correlated records once per connection.
+  A global cooldown suppresses rapid new connections, and once
   a power action has been issued every later trigger is suppressed.
 - The proc root and command runner are injectable so the logic is unit-testable.
 """
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from dataclasses import dataclass, field
 import json
 import os
+import re
 from pathlib import Path
-import secrets
-import stat
 import subprocess
 import sys
 import time
+import uuid
+
+from response_delete import DeleteError, DeleteReport, secure_delete, validate_root
 
 SCHEMA_VERSION = 1
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = REPO_ROOT / "config" / "responses.json"
 PROC_ROOT = Path("/proc")
 MAX_CONFIG_BYTES = 65536
-CHUNK_BYTES = 1024 * 1024
 COMMAND_TIMEOUT_S = 15
+MAX_EVENT_AGE_NS = 2_000_000_000
+MAX_SEEN_CONNECTIONS = 4096
 
 ACTION_TYPES = ("lock_session", "delete", "sanitise", "power")
 POWER_MODES = {"poweroff": "o", "reboot": "b"}  # value: sysrq trigger character
@@ -54,11 +60,6 @@ SANITISE_ITEMS = {
     "trash": (".local/share/Trash",),
     "drop_caches": (),
 }
-
-# Never accepted as (or inside) a deletion root: deleting here would damage the OS.
-FORBIDDEN_TREES = ("/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/libx32",
-                   "/proc", "/run", "/sbin", "/snap", "/sys", "/usr", "/var")
-
 
 class ResponseError(RuntimeError):
     pass
@@ -78,9 +79,13 @@ def _unique_keys(pairs):
     return result
 
 
+def _reject_constant(value):
+    raise ResponseError(f"Non-finite JSON number: {value}")
+
+
 def _parse_json(raw, what):
     try:
-        return json.loads(raw, object_pairs_hook=_unique_keys)
+        return json.loads(raw, object_pairs_hook=_unique_keys, parse_constant=_reject_constant)
     except (ValueError, UnicodeError) as error:
         raise ResponseError(f"Invalid JSON in {what}: {error}") from error
 
@@ -91,18 +96,10 @@ def _within(path, root):
 
 
 def _check_root(value, what):
-    """Validate a deletion root: absolute, at least two levels deep, not a system tree."""
-    if not isinstance(value, str) or not value or "\x00" in value:
-        raise ResponseError(f"{what} must be a non-empty path string")
-    path = Path(os.path.normpath(value))
-    if not path.is_absolute():
-        raise ResponseError(f"{what} must be an absolute path: {value!r}")
-    if len(path.parts) < 3:  # ("/", "home", "nelson") is the shallowest accepted
-        raise ResponseError(f"{what} is too broad (needs at least two levels, e.g. /home/user): {value!r}")
-    for tree in FORBIDDEN_TREES:
-        if _within(path, Path(tree)):
-            raise ResponseError(f"{what} is inside protected system tree {tree}: {value!r}")
-    return path
+    try:
+        return validate_root(value, what, allow_final_symlink=what == "delete path")
+    except DeleteError as error:
+        raise ResponseError(str(error)) from error
 
 
 def _check_keys(document, allowed, what):
@@ -147,7 +144,7 @@ def _validate_action(index, action, allowed_roots):
     if kind == "sanitise":
         _check_keys(action, ("type", "home_dirs", "items", "passes"), f"{kind} action")
         items = action.get("items")
-        if not isinstance(items, list) or not items or len(set(items)) != len(items) \
+        if not isinstance(items, list) or not items or any(not isinstance(i, str) for i in items) or len(set(items)) != len(items) \
                 or any(item not in SANITISE_ITEMS for item in items):
             raise ResponseError(f"sanitise.items must be a non-empty list of distinct items from: "
                                 f"{', '.join(SANITISE_ITEMS)}")
@@ -160,7 +157,7 @@ def _validate_action(index, action, allowed_roots):
     _check_keys(action, ("type", "mode", "method"), f"{kind} action")
     mode = action.get("mode", "poweroff")
     method = action.get("method", "graceful")
-    if mode not in POWER_MODES:
+    if not isinstance(mode, str) or mode not in POWER_MODES:
         raise ResponseError(f"power.mode must be one of {', '.join(POWER_MODES)}")
     if method not in POWER_METHODS:
         raise ResponseError(f"power.method must be one of {', '.join(POWER_METHODS)}")
@@ -231,11 +228,15 @@ def load_config(path):
 class SystemExecutor:
     """Side effects behind one seam: commands, /proc writes, disk sync and random data."""
 
-    def __init__(self, proc_root=PROC_ROOT, runner=subprocess.run, sync=os.sync, randbytes=os.urandom):
+    def __init__(self, proc_root=PROC_ROOT, runner=subprocess.run, sync=None, randbytes=os.urandom):
         self.proc_root = Path(proc_root)
         self.runner = runner
-        self.sync = sync
+        self.sync = sync if sync is not None else getattr(os, 'sync', self._unsupported_sync)
         self.randbytes = randbytes
+
+    @staticmethod
+    def _unsupported_sync():
+        raise ResponseError("Disk sync requires a supported Linux runtime")
 
     def run(self, argv):
         """Run a command; return (ok, detail). Never raises for a failing command."""
@@ -257,144 +258,6 @@ class SystemExecutor:
                 handle.write(value)
         except OSError as error:
             raise ResponseError(f"Cannot write /proc/{relative}: {error}") from error
-
-
-# --- Secure deletion -------------------------------------------------------------------
-
-@dataclass
-class DeleteReport:
-    files: int = 0
-    others: int = 0  # symlinks, FIFOs, sockets, device nodes: unlinked, never opened
-    dirs: int = 0
-    bytes: int = 0
-    absent: list = field(default_factory=list)
-    errors: list = field(default_factory=list)
-    planned: list = field(default_factory=list)
-
-    def as_dict(self, apply):
-        out = {"files": self.files, "other_entries": self.others, "dirs": self.dirs, "bytes": self.bytes,
-               "absent": self.absent, "errors": self.errors}
-        if not apply:
-            out["would_delete"] = self.planned[:200]
-            out["would_delete_truncated"] = len(self.planned) > 200
-        return out
-
-
-def _real_location(path):
-    """Resolve the parent directory's symlinks but keep the final component as named.
-
-    This is where an unlink would actually act, so it is what must stay inside the root.
-    """
-    return Path(os.path.realpath(path.parent)) / path.name
-
-
-def _overwrite_file(path, passes, randbytes):
-    """Overwrite a regular file in place, then truncate, rename and unlink it. Returns its size."""
-    flags = os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-    fd = os.open(path, flags)
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise OSError(f"not a regular file: {path}")
-        size = info.st_size
-        for _ in range(passes):
-            os.lseek(fd, 0, os.SEEK_SET)
-            remaining = size
-            while remaining:
-                block = randbytes(min(CHUNK_BYTES, remaining))
-                view = memoryview(block)
-                while view:  # os.write may write less than asked
-                    written = os.write(fd, view)
-                    view = view[written:]
-                remaining -= len(block)
-            os.fsync(fd)
-        os.ftruncate(fd, 0)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    # A random name hides the original file name from a later directory-entry scan.
-    scrambled = path.with_name("." + secrets.token_hex(8))
-    os.rename(path, scrambled)
-    os.unlink(scrambled)
-    return size
-
-
-def _remove_entry(path, passes, apply, report, randbytes):
-    """Delete one non-directory entry: overwrite regular files, unlink everything else."""
-    try:
-        info = os.lstat(path)
-    except FileNotFoundError:
-        return
-    if not apply:
-        report.planned.append(str(path))
-        if stat.S_ISREG(info.st_mode):
-            report.files += 1
-            report.bytes += info.st_size
-        else:
-            report.others += 1
-        return
-    try:
-        if stat.S_ISREG(info.st_mode):
-            report.bytes += _overwrite_file(path, passes, randbytes)
-            report.files += 1
-        else:  # symlink, fifo, socket or device node: never open it, just remove the name
-            os.unlink(path)
-            report.others += 1
-    except OSError as error:
-        report.errors.append({"path": str(path), "error": str(error)})
-
-
-def secure_delete(target, roots, passes, apply, randbytes=os.urandom, report=None):
-    """Securely delete ``target`` (file, symlink or directory tree) if it lies inside ``roots``.
-
-    The containment check is repeated here, with symlinks in the parent path resolved,
-    because the filesystem may have changed since the config was validated.
-    """
-    report = report or DeleteReport()
-    target = Path(target)
-    real = _real_location(target)
-    real_roots = [Path(os.path.realpath(root)) for root in roots]
-    if not any(_within(real, root) and real != root for root in real_roots):
-        report.errors.append({"path": str(target), "error": "outside allowed roots after resolving symlinks"})
-        return report
-    try:
-        info = os.lstat(real)
-    except FileNotFoundError:
-        report.absent.append(str(target))
-        return report
-    except OSError as error:
-        report.errors.append({"path": str(target), "error": str(error)})
-        return report
-    if not stat.S_ISDIR(info.st_mode):
-        _remove_entry(real, passes, apply, report, randbytes)
-        return report
-
-    def walk_error(error):
-        report.errors.append({"path": str(getattr(error, "filename", target)), "error": str(error)})
-
-    # Bottom-up and without following links, so a symlinked directory is removed as a link
-    # and every directory is reached after its contents.
-    dirs = []
-    for directory, subdirs, files in os.walk(real, topdown=False, onerror=walk_error, followlinks=False):
-        base = Path(directory)
-        for name in files:
-            _remove_entry(base / name, passes, apply, report, randbytes)
-        for name in subdirs:
-            child = base / name
-            if child.is_symlink():  # os.walk lists symlinked dirs in subdirs
-                _remove_entry(child, passes, apply, report, randbytes)
-        dirs.append(base)
-    for directory in dirs:
-        if not apply:
-            report.planned.append(str(directory) + "/")
-            report.dirs += 1
-            continue
-        try:
-            os.rmdir(directory)
-            report.dirs += 1
-        except OSError as error:
-            report.errors.append({"path": str(directory), "error": str(error)})
-    return report
 
 
 # --- Actions ---------------------------------------------------------------------------
@@ -424,7 +287,7 @@ class ActionRunner:
         handler = getattr(self, "_" + action["type"])
         try:
             ok, detail = handler(action)
-        except ResponseError as error:
+        except (ResponseError, OSError) as error:
             ok, detail = False, {"error": str(error)}
         return ok, detail
 
@@ -491,7 +354,7 @@ class ResponseEngine:
     record is written before the machine goes down.
     """
 
-    def __init__(self, config, executor, out=emit, apply=False, clock=time.monotonic_ns):
+    def __init__(self, config, executor, out=emit, apply=False, clock=time.monotonic_ns, boot_id=None):
         self.config = config
         self.runner = ActionRunner(config, executor, apply=apply)
         self.out = out
@@ -504,23 +367,130 @@ class ResponseEngine:
         self.input_errors = 0
         self.monitor_healthy = None
         self.upstream_close = None
+        self.upstream_failed = False
+        self.boot_id = boot_id
+        self.producer = None
+        self.producer_apply = None
+        self.session_id = None
+        self.seen_connections = set()
+        self.seen_order = deque()
+
+    def _input_error(self, message):
+        self.input_errors += 1
+        self.out({"type": "response_input_error", "message": message})
+
+    def _envelope(self, record, starting=False):
+        if self.boot_id is None:
+            try:
+                self.boot_id = str(uuid.UUID(Path("/proc/sys/kernel/random/boot_id").read_text().strip()))
+            except (OSError, ValueError) as error:
+                raise ResponseError(f"Cannot verify the producer boot: {error}") from error
+        if record.get("boot_id") != self.boot_id or record.get("clock") != "monotonic":
+            raise ResponseError("Enforcement record is from an unknown boot or clock")
+        timestamp = record.get("emitted_timestamp_ns")
+        if type(timestamp) is not int or not 0 <= self.clock() - timestamp <= MAX_EVENT_AGE_NS:
+            raise ResponseError("Stale, future or missing enforcement timestamp")
+        producer = record.get("enforcement_instance_id")
+        if not isinstance(producer, str) or not 1 <= len(producer) <= 128:
+            raise ResponseError("Missing enforcement producer identity")
+        apply = record.get("enforcement_apply")
+        if type(apply) is not bool:
+            raise ResponseError("Missing enforcement apply/dry-run context")
+        if not starting and (producer != self.producer or apply is not self.producer_apply):
+            raise ResponseError("Record is not from the current enforcement producer")
+
+    def _connection(self, record):
+        usb_id = record.get("usb_id")
+        if not isinstance(usb_id, str) or not re.fullmatch(r"[1-9][0-9]*-[1-9][0-9]*(?:\.[1-9][0-9]*)*", usb_id):
+            raise ResponseError("Invalid or missing USB identity")
+        connection = record.get("connection_id")
+        prefix = self.boot_id + ":" + usb_id + ":"
+        if not isinstance(connection, str) or len(connection) >= 256 or not connection.startswith(prefix):
+            raise ResponseError("Missing or mismatched connection identity")
+        generation = connection[len(prefix):]
+        if not generation.isascii() or not generation.isdecimal() or not 0 < int(generation) <= record["emitted_timestamp_ns"]:
+            raise ResponseError("Invalid connection generation")
+        if record.get("session_id") != self.session_id or self.monitor_healthy is not True:
+            raise ResponseError("Trigger is not from a healthy current monitor session")
+        if self.apply and self.producer_apply is not True:
+            raise ResponseError("Live responses refuse dry-run enforcement input")
+        if record["type"] == "enforcement_result":
+            device = record.get("device")
+            if (not isinstance(device, dict) or device.get("usb_id") != usb_id
+                    or device.get("is_root_hub") is not False
+                    or type(device.get("device_address")) is not int
+                    or not 1 <= device["device_address"] <= 127):
+                raise ResponseError("Blocked-device record has incomplete identity context")
+        return connection
 
     def is_trigger(self, record):
         kind = record.get("type")
         if kind == "enforcement_result":
             return record.get("action") == "block"
         if kind == "enforcement_skipped":
-            return self.config.include_skipped and record.get("requested_action") == "block"
+            return (self.config.include_skipped and record.get("requested_action") == "block"
+                    and record.get("policy_reason") == "no_matching_allowlist_rule"
+                    and record.get("reason") in {"device_unavailable", "device_changed", "stale_device"})
         return False
 
     def handle(self, record):
-        if not isinstance(record, dict) or record.get("schema_version") != SCHEMA_VERSION:
-            self.input_errors += 1
-            self.out({"type": "response_input_error", "message": "Expected enforcement schema_version 1"})
+        if (not isinstance(record, dict) or type(record.get("schema_version")) is not int
+                or record["schema_version"] != SCHEMA_VERSION):
+            self._input_error("Expected enforcement schema_version integer 1")
             return
         kind = record.get("type")
+        if not isinstance(kind, str):
+            self._input_error("Record type must be a string")
+            return
+        relevant = {"enforcement_started", "enforcement_result", "enforcement_skipped", "enforcement_monitor_status",
+                    "enforcement_stream_closed", "enforcement_error", "enforcement_input_error"}
+        if kind not in relevant and not (isinstance(kind, str) and kind.startswith("lsm_")):
+            return
+        try:
+            self._envelope(record, starting=kind == "enforcement_started")
+        except ResponseError as error:
+            self._input_error(str(error))
+            return
+        if kind == "enforcement_started":
+            if record.get("apply") is not record["enforcement_apply"]:
+                self._input_error("Inconsistent enforcement mode")
+                return
+            if self.producer is not None:
+                if record["enforcement_instance_id"] != self.producer or record["enforcement_apply"] is not self.producer_apply:
+                    self._input_error("A new enforcement producer requires a fresh response watcher")
+                return  # A repeated header must never reset deduplication or failure state.
+            self.producer = record["enforcement_instance_id"]
+            self.producer_apply = record["enforcement_apply"]
+            self.monitor_healthy = None
+            self.session_id = None
+            self.upstream_close = None
+            self.seen_connections.clear()
+            self.seen_order.clear()
+            return
+        if isinstance(kind, str) and kind.startswith("lsm_"):
+            if kind == "lsm_bridge_error":
+                self.upstream_failed = True
+            self.out(record)  # Preserve Step 6's observability in a four-stage pipeline.
+            return
+        if kind in {"enforcement_error", "enforcement_input_error"}:
+            self.upstream_failed = True
+            self.out({"type": "response_upstream_error", "record": record})
+            return
         if kind == "enforcement_monitor_status":
             healthy = record.get("healthy")
+            session = record.get("session_id")
+            if not isinstance(session, str) or not 1 <= len(session) <= 128 or type(healthy) is not bool:
+                self._input_error("Invalid monitor session/status")
+                return
+            if record.get("monitor_type") == "monitor_starting":
+                self.session_id = session
+            elif self.session_id is not None and session != self.session_id:
+                self._input_error("Monitor status belongs to another session")
+                return
+            self.session_id = session
+            if (record.get("degraded") is True or (healthy is False and
+                    record.get("monitor_type") not in {"monitor_starting", "monitor_stopped"})):
+                self.upstream_failed = True
             if type(healthy) is bool and healthy != self.monitor_healthy:
                 self.monitor_healthy = healthy
                 self.out({"type": "response_monitor_status", "healthy": healthy,
@@ -528,8 +498,26 @@ class ResponseEngine:
             return
         if kind == "enforcement_stream_closed":
             self.upstream_close = record
+            self.upstream_failed |= record.get("ok") is not True
+            self.monitor_healthy = False
             return
         if self.is_trigger(record):
+            try:
+                connection = self._connection(record)
+            except ResponseError as error:
+                self._input_error(str(error))
+                return
+            if self.upstream_close is not None:
+                self._input_error("Record arrived after enforcement closed")
+                return
+            if connection in self.seen_connections:
+                self.out({"type": "response_suppressed", "reason": "duplicate_connection",
+                          "usb_id": record["usb_id"], "connection_id": connection})
+                return
+            self.seen_connections.add(connection)
+            self.seen_order.append(connection)
+            if len(self.seen_order) > MAX_SEEN_CONNECTIONS:
+                self.seen_connections.remove(self.seen_order.popleft())
             self.fire(record)
 
     def fire(self, record):
@@ -567,7 +555,18 @@ class ResponseEngine:
                           "usb_id": context.get("usb_id"),
                           "since_trigger_ns": self.clock() - now})
             started = self.clock()
-            ok, detail = self.runner.run(action)
+            try:
+                ok, detail = self.runner.run(action)
+            except KeyboardInterrupt:
+                # A requested stop during a side effect is not proof that it completed.
+                self.failures += 1
+                if action["type"] == "power":
+                    self.power_issued = False
+                self.out({"type": "response_action", "response_id": response_id,
+                          "action": action["type"], "status": "interrupted", "ok": False,
+                          "applied": self.apply, "usb_id": context.get("usb_id"),
+                          "detail": {"error": "Action interrupted; inspect partial effects and retained deletion directories"}})
+                raise
             finished = self.clock()
             if not ok:
                 failed += 1
@@ -591,7 +590,7 @@ class ResponseEngine:
             upstream_ok = self.upstream_close.get("ok") is True
         else:
             reason, upstream_ok = "unexpected_end_of_input", False
-        return reason, upstream_ok and not self.failures and not self.input_errors
+        return reason, upstream_ok and not self.upstream_failed and not self.failures and not self.input_errors
 
 
 def process_stream(engine, stream):

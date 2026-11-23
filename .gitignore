@@ -3,6 +3,7 @@
 *.o
 *.a
 *.so
+/src/enforcement/bpf/build
 
 # Runtime output
 /logs/
@@ -18,5 +19,10 @@ __pycache__/
 # copy docs/ by hand if the repo is ever moved or re-cloned.
 /docs/dev-log.md
 /docs/DEVELOPMENT-JOURNAL.md
-# Personal response configs (machine-specific paths)
+
+# Generated BPF-LSM build artefacts
+/src/enforcement/bpf/build/lsm_guard.bpf.o
+/src/enforcement/bpf/build/lsm_controller
+
+# Machine-specific response configurations
 /config/*.local.json

@@ -1,0 +1,14 @@
+#ifndef PORTWATCHMAN_LSM_SHARED_H
+#define PORTWATCHMAN_LSM_SHARED_H
+#define PW_MAX_TARGETS 128
+struct target_identity {
+    __u32 major;
+    __u32 minor;
+    __u64 inode;
+};
+struct target_stats {
+    __u64 denied_opens;
+};
+_Static_assert(sizeof(struct target_identity) == 16, "BPF/user-space key ABI mismatch");
+_Static_assert(sizeof(struct target_stats) == 8, "BPF/user-space counter ABI mismatch");
+#endif

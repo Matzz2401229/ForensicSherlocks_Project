@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "socket_path": "/run/portwatchman/lsm_controller.sock",
+  "registration_timeout_seconds": 30,
+  "on_error": "report",
+  "rules": [
+    {
+      "allowlist_rule": "lab-flash-drive",
+      "protected_paths": ["portwatchman-lsm-test.txt"]
+    }
+  ]
+}

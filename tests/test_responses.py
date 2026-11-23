@@ -11,12 +11,15 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "responses"))
 import responses
+import response_delete
 from responses import (ActionRunner, ResponseEngine, ResponseError, SystemExecutor,
                        load_config, main, power_command, process_stream, secure_delete,
                        validate_document)
 
 REPO = Path(__file__).resolve().parents[1]
-POSIX = os.name == "posix"
+POSIX = sys.platform == "linux"
+BOOT_ID = "11111111-1111-4111-8111-111111111111"
+PRODUCER_ID = "22222222-2222-4222-8222-222222222222"
 
 
 def setUpModule():
@@ -97,18 +100,29 @@ class Fixture(unittest.TestCase):
         return path
 
     def engine(self, actions, apply=True, clock=None, **extra):
-        return ResponseEngine(self.config(actions, **extra), self.executor, out=self.records.append,
-                              apply=apply, clock=clock or FakeClock())
+        engine = ResponseEngine(self.config(actions, **extra), self.executor, out=self.records.append,
+                                apply=apply, clock=clock or FakeClock(), boot_id=BOOT_ID)
+        engine.producer, engine.producer_apply = PRODUCER_ID, True
+        engine.session_id, engine.monitor_healthy = "s1", True
+        return engine
 
     def of_type(self, kind):
         return [record for record in self.records if record["type"] == kind]
 
 
+def source_record(kind, **extra):
+    return {"schema_version": 1, "type": kind, "boot_id": BOOT_ID, "clock": "monotonic",
+            "emitted_timestamp_ns": 1_000_000_000, "enforcement_instance_id": PRODUCER_ID,
+            "enforcement_apply": True, **extra}
+
+
 def blocked(usb_id="2-1", **extra):
-    return {"schema_version": 1, "type": "enforcement_result", "action": "block", "usb_id": usb_id,
-            "enforcement_applied": False, "reason": "already_blocked", "connection_id": "c1",
-            "session_id": "s1", "policy_reason": "no_matching_rule", "enforcement_latency_ns": 1234,
-            **extra}
+    generation = extra.pop("generation", 1)
+    return source_record("enforcement_result", action="block", usb_id=usb_id,
+                         enforcement_applied=False, reason="already_blocked",
+                         connection_id=f"{BOOT_ID}:{usb_id}:{generation}", session_id="s1",
+                         device={"usb_id": usb_id, "device_address": 2, "is_root_hub": False},
+                         policy_reason="no_matching_allowlist_rule", enforcement_latency_ns=1234) | extra
 
 
 class ConfigTests(Fixture):
@@ -218,22 +232,31 @@ class SecureDeleteTests(Fixture):
         self.assertEqual(list(self.allowed.iterdir()), [])  # no renamed leftovers
 
     def test_overwrite_reaches_the_file_contents(self):
-        # A hard link outside the tree shares the inode, so it shows what was written.
         target = self.write(self.allowed / "a.bin", b"plaintext!" * 10)
-        witness = self.outside / "witness"
-        os.link(target, witness)
         seen = []
         original = os.ftruncate
-
         def capture(fd, length):
-            seen.append(witness.read_bytes())
+            reader = os.open(f"/proc/self/fd/{fd}", os.O_RDONLY)
+            try:
+                seen.append(os.read(reader, 1000))
+            finally:
+                os.close(reader)
             return original(fd, length)
-
         with mock.patch("os.ftruncate", capture):
-            secure_delete(target, [self.allowed], 1, apply=True, randbytes=self._randbytes)
+            report = secure_delete(target, [self.allowed], 1, apply=True, randbytes=self._randbytes)
+        self.assertEqual(report.errors, [])
         self.assertEqual(seen, [b"\xa5" * 100])
-        self.assertEqual(witness.read_bytes(), b"")  # truncated after overwriting
         self.assertFalse(target.exists())
+
+    def test_hard_link_outside_root_is_not_overwritten(self):
+        target = self.write(self.allowed / "a.bin", b"keep this data")
+        witness = self.outside / "witness"
+        os.link(target, witness)
+        report = secure_delete(target, [self.allowed], 1, apply=True, randbytes=self._randbytes)
+        self.assertTrue(report.errors)
+        self.assertEqual(witness.read_bytes(), b"keep this data")
+        self.assertEqual(target.read_bytes(), b"keep this data")
+        self.assertEqual(self.random_bytes, 0)
 
     def test_absent_target_is_reported_not_an_error(self):
         report = secure_delete(self.allowed / "nothing", [self.allowed], 1, apply=True)
@@ -284,7 +307,9 @@ class SecureDeleteTests(Fixture):
             report = secure_delete(self.allowed / "docs", [self.allowed], 1, apply=True,
                                    randbytes=self._randbytes)
         self.assertFalse((self.allowed / "docs" / "b.txt").exists())
-        self.assertTrue((self.allowed / "docs" / "a.txt").exists())
+        self.assertTrue(report.retained)
+        retained = Path(report.retained[0]) / "target" / "a.txt"
+        self.assertTrue(retained.exists())
         self.assertEqual(report.files, 1)
         paths = [error["path"] for error in report.errors]
         self.assertIn(str(self.allowed / "docs" / "a.txt"), paths)
@@ -398,23 +423,23 @@ class EngineTests(Fixture):
     def test_only_blocked_devices_trigger(self):
         engine = self.engine([{"type": "lock_session"}], cooldown_seconds=0)
         for record in (blocked(action="allow"), blocked(action="ignore"), blocked(action="unchanged"),
-                       {"schema_version": 1, "type": "enforcement_started"},
-                       {"schema_version": 1, "type": "enforcement_skipped", "requested_action": "block"}):
+                       source_record("enforcement_started", apply=True),
+                       source_record("enforcement_skipped", requested_action="block")):
             engine.handle(record)
         self.assertEqual(self.runner.calls, [])
         engine.handle(blocked())
         self.assertEqual(self.runner.calls, [["loginctl", "lock-sessions"]])
         triggered, = self.of_type("response_triggered")
         self.assertEqual(triggered["usb_id"], "2-1")
-        self.assertEqual(triggered["connection_id"], "c1")
+        self.assertEqual(triggered["connection_id"], f"{BOOT_ID}:2-1:1")
         self.assertEqual(triggered["upstream_enforcement_latency_ns"], 1234)
 
     def test_skipped_blocks_trigger_when_configured(self):
         engine = self.engine([{"type": "lock_session"}], trigger={"include_skipped": True})
         engine.handle({"schema_version": 1, "type": "enforcement_skipped", "requested_action": "allow"})
         self.assertEqual(self.runner.calls, [])
-        engine.handle({"schema_version": 1, "type": "enforcement_skipped", "requested_action": "block",
-                       "reason": "stale_decision", "usb_id": "2-1"})
+        engine.handle({**blocked(), "type": "enforcement_skipped", "requested_action": "block",
+                       "reason": "device_unavailable"})
         self.assertEqual(len(self.runner.calls), 1)
 
     def test_cooldown_suppresses_repeat_triggers(self):
@@ -422,12 +447,12 @@ class EngineTests(Fixture):
         engine = self.engine([{"type": "lock_session"}], clock=clock, cooldown_seconds=10)
         engine.handle(blocked())
         clock.advance(4)
-        engine.handle(blocked())
+        engine.handle(blocked(generation=2, emitted_timestamp_ns=clock.now))
         suppressed, = self.of_type("response_suppressed")
         self.assertEqual(suppressed["reason"], "cooldown")
         self.assertAlmostEqual(suppressed["cooldown_remaining_s"], 6.0)
         clock.advance(6)
-        engine.handle(blocked())
+        engine.handle(blocked(generation=3, emitted_timestamp_ns=clock.now))
         self.assertEqual(len(self.runner.calls), 2)
         self.assertEqual([r["response_id"] for r in self.of_type("response_triggered")], [1, 2])
 
@@ -467,7 +492,7 @@ class EngineTests(Fixture):
         self.runner.returncode = 1
         engine = self.engine([{"type": "power"}], cooldown_seconds=0)
         engine.handle(blocked())
-        engine.handle(blocked())
+        engine.handle(blocked(generation=2))
         self.assertEqual(len(self.runner.calls), 2)
         self.assertEqual(self.of_type("response_suppressed"), [])
 
@@ -485,7 +510,8 @@ class EngineTests(Fixture):
 
     def test_monitor_status_is_reported_on_change_only(self):
         engine = self.engine([{"type": "lock_session"}])
-        status = {"schema_version": 1, "type": "enforcement_monitor_status", "healthy": True}
+        engine.monitor_healthy = None
+        status = source_record("enforcement_monitor_status", healthy=True, session_id="s1", monitor_type="monitor_alive")
         engine.handle(status)
         engine.handle(status)
         engine.handle({**status, "healthy": False})
@@ -500,7 +526,8 @@ class EngineTests(Fixture):
 
 class StreamTests(Fixture):
     def stream(self, *records):
-        return io.StringIO("".join((r if isinstance(r, str) else json.dumps(r)) + "\n" for r in records))
+        return io.StringIO("".join((r if isinstance(r, str) else json.dumps(
+            {**source_record(r.get("type")), **r})) + "\n" for r in records))
 
     def closed(self):
         record, = self.of_type("response_stream_closed")
@@ -551,6 +578,241 @@ class StreamTests(Fixture):
         engine = self.engine([{"type": "lock_session"}])
         self.assertEqual(process_stream(engine, Interrupting()), 0)
         self.assertEqual(self.closed()["reason"], "requested_stop")
+
+
+class ReviewRegressionTests(Fixture):
+    def test_interrupt_during_action_is_not_a_successful_stop(self):
+        engine = self.engine([{"type": "lock_session"}])
+        with mock.patch.object(engine.runner, "run", side_effect=KeyboardInterrupt):
+            result = process_stream(engine, io.StringIO(json.dumps(blocked()) + "\n"))
+        self.assertEqual(result, 1)
+        self.assertEqual(engine.failures, 1)
+        self.assertEqual(self.of_type("response_action")[0]["status"], "interrupted")
+        self.assertFalse(self.of_type("response_stream_closed")[0]["ok"])
+
+    def test_allowed_root_symlink_is_rejected_without_touching_destination(self):
+        precious = self.write(self.outside / "precious.txt", b"keep")
+        alias = self.allowed / "alias"
+        alias.symlink_to(self.outside, target_is_directory=True)
+        with self.assertRaises(ResponseError):
+            validate_document({"schema_version": 1, "allowed_roots": [str(alias)],
+                               "actions": [{"type": "delete", "paths": [str(alias / "precious.txt")]}]})
+        report = secure_delete(alias / "precious.txt", [alias], 1, apply=True)
+        self.assertTrue(report.errors)
+        self.assertEqual(precious.read_bytes(), b"keep")
+
+    def test_parent_swap_cannot_redirect_to_outside_file(self):
+        target = self.write(self.allowed / "docs" / "file", b"selected")
+        precious = self.write(self.outside / "precious" / "file", b"keep")
+        original = response_delete._open_parent
+        def swapped(*args):
+            fd = original(*args)
+            (self.allowed / "docs").rename(self.outside / "held")
+            (self.allowed / "docs").symlink_to(self.outside / "precious", target_is_directory=True)
+            return fd
+        with mock.patch.object(response_delete, "_open_parent", side_effect=swapped):
+            report = secure_delete(target, [self.allowed], 1, True, self._randbytes)
+        self.assertEqual(report.errors, [])
+        self.assertEqual(precious.read_bytes(), b"keep")
+        self.assertFalse((self.outside / "held" / "file").exists())
+
+    def test_capture_swap_is_retained_without_overwriting(self):
+        target = self.write(self.allowed / "file", b"selected")
+        precious = self.write(self.outside / "precious", b"keep")
+        original = os.rename
+        def swapped(source, destination, **kwargs):
+            if source == "file":
+                original(source, "file.saved", src_dir_fd=kwargs["src_dir_fd"], dst_dir_fd=kwargs["src_dir_fd"])
+                os.symlink(precious, source, dir_fd=kwargs["src_dir_fd"])
+            return original(source, destination, **kwargs)
+        with mock.patch.object(response_delete.os, "rename", side_effect=swapped):
+            report = secure_delete(target, [self.allowed], 1, True, self._randbytes)
+        self.assertTrue(report.errors)
+        self.assertTrue(report.retained)
+        self.assertEqual(precious.read_bytes(), b"keep")
+        self.assertEqual((self.allowed / "file.saved").read_bytes(), b"selected")
+        self.assertEqual(self.random_bytes, 0)
+
+    def test_nested_hard_link_is_retained_and_outside_data_unchanged(self):
+        target = self.write(self.allowed / "docs" / "file", b"keep")
+        precious = self.outside / "witness"
+        os.link(target, precious)
+        report = secure_delete(target.parent, [self.allowed], 1, True, self._randbytes)
+        self.assertTrue(report.errors)
+        self.assertTrue(report.retained)
+        self.assertEqual(precious.read_bytes(), b"keep")
+
+    def test_mount_crossing_is_rejected_before_overwrite(self):
+        target = self.write(self.allowed / "file", b"keep")
+        original = response_delete._mount_id
+        count = 0
+        def other_mount(fd):
+            nonlocal count
+            count += 1
+            return original(fd) if count == 1 else original(fd) + 1
+        with mock.patch.object(response_delete, "_mount_id", side_effect=other_mount):
+            report = secure_delete(target, [self.allowed], 1, True, self._randbytes)
+        self.assertTrue(report.errors)
+        self.assertEqual(target.read_bytes(), b"keep")
+
+    def test_metadata_error_does_not_skip_configured_power_action(self):
+        target = self.write(self.allowed / "docs" / "file")
+        engine = self.engine([{"type": "delete", "paths": [str(target.parent)]}, {"type": "power"}])
+        original = response_delete._pin
+        def failed(parent, name, mount):
+            if name == "file":
+                raise OSError(5, "injected metadata I/O failure")
+            return original(parent, name, mount)
+        with mock.patch.object(response_delete, "_pin", side_effect=failed):
+            engine.handle(blocked())
+        actions = [r for r in self.of_type("response_action") if r["status"] != "issuing"]
+        self.assertEqual([r["ok"] for r in actions], [False, True])
+        self.assertEqual(self.runner.calls, [["systemctl", "poweroff"]])
+        self.assertEqual(engine.failures, 1)
+
+    def test_unexpected_action_oserror_is_reported_and_remaining_actions_run(self):
+        engine = self.engine([{"type": "delete", "paths": [str(self.allowed / "file")]}, {"type": "power"}])
+        with mock.patch.object(engine.runner, "_delete", side_effect=PermissionError("injected")):
+            engine.handle(blocked())
+        self.assertEqual(self.runner.calls, [["systemctl", "poweroff"]])
+        self.assertEqual(engine.failures, 1)
+
+    def test_sync_failure_does_not_claim_power_was_issued(self):
+        engine = self.engine([{"type": "power", "method": "immediate"}])
+        with mock.patch.object(self.executor, "sync", side_effect=OSError("injected")):
+            engine.handle(blocked())
+        self.assertFalse(engine.power_issued)
+        self.assertEqual(engine.failures, 1)
+        self.assertFalse((self.proc / "sysrq-trigger").exists())
+
+    def test_upstream_failure_survives_ctrl_c(self):
+        engine = self.engine([{"type": "lock_session"}])
+        class Interrupting:
+            def __iter__(self):
+                yield json.dumps(source_record("enforcement_stream_closed", reason="upstream_failed", ok=False)) + "\n"
+                raise KeyboardInterrupt
+        self.assertEqual(process_stream(engine, Interrupting()), 1)
+        self.assertFalse(self.of_type("response_stream_closed")[0]["ok"])
+
+    def test_degraded_monitor_survives_ctrl_c(self):
+        engine = self.engine([{"type": "lock_session"}])
+        engine.handle(source_record("enforcement_monitor_status", session_id="s1", healthy=False,
+                                    degraded=True, monitor_type="monitor_heartbeat"))
+        self.assertFalse(engine.outcome(interrupted=True)[1])
+
+    def test_normal_start_and_stop_status_do_not_poison_clean_exit(self):
+        engine = self.engine([{"type": "lock_session"}])
+        engine.handle(source_record("enforcement_monitor_status", session_id="s1", healthy=False,
+                                    monitor_type="monitor_starting"))
+        engine.handle(source_record("enforcement_monitor_status", session_id="s1", healthy=True,
+                                    monitor_type="monitor_alive"))
+        engine.handle(source_record("enforcement_monitor_status", session_id="s1", healthy=False,
+                                    degraded=False, monitor_type="monitor_stopped"))
+        engine.handle(source_record("enforcement_stream_closed", ok=True, reason="requested_stop"))
+        self.assertTrue(engine.outcome(interrupted=False)[1])
+
+    def test_bad_trigger_context_never_runs_actions(self):
+        cases = [{"connection_id": None}, {"session_id": "other"}, {"boot_id": "old-boot"},
+                 {"enforcement_instance_id": "another-producer"}, {"emitted_timestamp_ns": -1},
+                 {"emitted_timestamp_ns": 2_000_000_000}, {"schema_version": True},
+                 {"device": {}}, {"type": []}]
+        for extra in cases:
+            with self.subTest(extra=extra):
+                self.records.clear()
+                self.runner.calls.clear()
+                engine = self.engine([{"type": "lock_session"}])
+                engine.handle(blocked(**extra))
+                self.assertFalse(self.runner.calls)
+                self.assertEqual(engine.input_errors, 1)
+
+    def test_stale_backlog_is_rejected(self):
+        clock = FakeClock()
+        engine = self.engine([{"type": "lock_session"}], clock=clock)
+        clock.advance(10)
+        engine.handle(blocked())
+        self.assertFalse(self.runner.calls)
+        self.assertEqual(engine.input_errors, 1)
+
+    def test_duplicate_does_not_trigger_after_cooldown_expires(self):
+        clock = FakeClock()
+        engine = self.engine([{"type": "lock_session"}], cooldown_seconds=0, clock=clock)
+        engine.handle(blocked())
+        clock.advance(1)
+        engine.handle(blocked(emitted_timestamp_ns=clock.now))
+        self.assertEqual(len(self.runner.calls), 1)
+        self.assertEqual(self.of_type("response_suppressed")[0]["reason"], "duplicate_connection")
+
+    def test_repeated_header_cannot_reset_deduplication(self):
+        engine = self.engine([{"type": "lock_session"}], cooldown_seconds=0)
+        engine.handle(blocked())
+        engine.handle(source_record("enforcement_started", apply=True))
+        engine.handle(blocked())
+        self.assertEqual(len(self.runner.calls), 1)
+
+    def test_live_responses_reject_upstream_dry_run(self):
+        engine = self.engine([{"type": "lock_session"}])
+        engine.producer_apply = False
+        engine.handle(blocked(enforcement_apply=False))
+        self.assertFalse(self.runner.calls)
+        self.assertEqual(engine.input_errors, 1)
+
+    def test_skipped_operational_errors_do_not_trigger_even_when_opted_in(self):
+        engine = self.engine([{"type": "lock_session"}], trigger={"include_skipped": True})
+        for reason in ("stale_decision", "uncorrelated_decision", "unmanaged_bus", "invalid_policy"):
+            engine.handle({**blocked(), "type": "enforcement_skipped", "requested_action": "block", "reason": reason})
+        self.assertFalse(self.runner.calls)
+
+    def test_lsm_errors_remain_visible_and_latch_failure(self):
+        engine = self.engine([{"type": "lock_session"}])
+        event = source_record("lsm_bridge_error", protection_complete=False, message="lost controller")
+        engine.handle(event)
+        self.assertIn(event, self.records)
+        self.assertFalse(engine.outcome(interrupted=True)[1])
+
+    def test_invalid_config_container_values_raise_controlled_errors(self):
+        for action in ({"type": "sanitise", "items": [{}]}, {"type": "power", "mode": []}):
+            with self.subTest(action=action), self.assertRaises(ResponseError):
+                self.config([action])
+
+
+class ProducerContractTests(Fixture):
+    def test_live_producer_context_has_boot_identity_and_mode(self):
+        sys.path.insert(0, str(REPO / "src/enforcement"))
+        import usb_authorization
+        with mock.patch.object(usb_authorization.Path, "read_text", return_value=BOOT_ID):
+            context = usb_authorization.response_stream_context(False)
+        self.assertEqual(context["boot_id"], BOOT_ID)
+        self.assertIs(context["enforcement_apply"], False)
+        self.assertTrue(context["enforcement_instance_id"])
+
+    def test_actual_stream_serializer_is_accepted_by_response_consumer(self):
+        sys.path.insert(0, str(REPO / "src/enforcement"))
+        import usb_authorization
+        outputs = [source_record("enforcement_monitor_status", healthy=False, monitor_type="monitor_starting", session_id="s1"),
+                   source_record("enforcement_monitor_status", healthy=True, monitor_type="monitor_alive", session_id="s1"), blocked()]
+        class Producer:
+            failures = input_errors = 0
+            def handle(self, record): return outputs.pop(0)
+            def outcome(self, interrupted): return "upstream_requested_stop", True
+        context = {"boot_id": BOOT_ID, "enforcement_instance_id": PRODUCER_ID, "enforcement_apply": True}
+        capture = io.StringIO()
+        with mock.patch.object(usb_authorization.time, "monotonic_ns", return_value=1_000_000_000), \
+                contextlib.redirect_stdout(capture):
+            usb_authorization.emit(usb_authorization.response_record({"type": "enforcement_started", "apply": True}, context))
+            self.assertEqual(usb_authorization.process_stream(Producer(), io.StringIO("{}\n{}\n{}\n"), response_context=context), 0)
+        engine = ResponseEngine(self.config([{"type": "lock_session"}]), self.executor,
+                                apply=True, out=self.records.append, clock=FakeClock(), boot_id=BOOT_ID)
+        for line in capture.getvalue().splitlines():
+            engine.handle(json.loads(line))
+        self.assertEqual(self.runner.calls, [["loginctl", "lock-sessions"]])
+        self.assertTrue(engine.outcome(interrupted=False)[1])
+
+    def test_missing_live_producer_header_refuses_trigger(self):
+        engine = ResponseEngine(self.config([{"type": "lock_session"}]), self.executor,
+                                apply=True, out=self.records.append, clock=FakeClock(), boot_id=BOOT_ID)
+        engine.handle(blocked())
+        self.assertFalse(self.runner.calls)
+        self.assertEqual(engine.input_errors, 1)
 
 
 class CliTests(Fixture):
