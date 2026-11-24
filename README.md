@@ -4,7 +4,7 @@ PortWatchman is a Linux USB monitoring, allowlisting, and enforcement project de
 
 The intended behaviour is to keep newly connected USB devices blocked until their reported attributes satisfy the allowlist. Unapproved devices remain blocked and can trigger a configured response, such as session locking or shutdown.
 
-**Current implementation:** USB monitoring, device identification/allowlist decisions, and USB access control are implemented and tested. Access control sets default-deny on managed USB buses, authorises allowed devices after re-validating them, keeps unapproved devices blocked, and reconciles devices connected before it started. Supplementary selected-file BPF-LSM enforcement, its root-only Unix socket and opt-in Python bridge are implemented and verified in the recorded Ubuntu VM environment, including coordinated USB removal/reconnection and report-only failure handling. Service orchestration remains planned. Step 7 passed 251 unit tests and the manual Ubuntu VM checks recorded below, covering USB-triggered locking, bridge integration, isolated file/trace cleanup and graceful guest poweroff. The policy watcher on its own still reports `enforcement_applied: false`; device access changes only when its decisions are piped into the enforcement stage.
+**Current implementation:** USB monitoring, device identification/allowlist decisions, and USB access control are implemented and tested. Access control sets default-deny on managed USB buses, authorises allowed devices after re-validating them, keeps unapproved devices blocked, and reconciles devices connected before it started. Supplementary selected-file BPF-LSM enforcement, its root-only Unix socket and opt-in Python bridge are implemented and verified in the recorded Ubuntu VM environment, including coordinated USB removal/reconnection and report-only failure handling. Step 8 service supervision and systemd installation are prepared, pending Ubuntu verification. Step 7 passed 251 unit tests and the manual Ubuntu VM checks recorded below, covering USB-triggered locking, bridge integration, isolated file/trace cleanup and graceful guest poweroff. The policy watcher on its own still reports `enforcement_applied: false`; device access changes only when its decisions are piped into the enforcement stage.
 
 ## Architecture
 
@@ -108,16 +108,51 @@ Run the Bash commands from your clone's repository root in the Linux system unde
 cd '/path/to/portwatchman'
 ```
 
-### Overall application — placeholder
+### Integrated running service (Step 8 — verification pending)
 
-The combined application entry point and service installation commands are not implemented yet.
+The foreground launcher supervises the four-stage pipeline and an optional owned
+BPF-LSM controller. It reports readiness only after healthy monitoring passes
+through every stage. `run` applies USB authorisation; response actions remain a
+preview unless explicitly enabled. The shipped service profile has no LSM bridge
+and preview responses. Prepare your own selected-bus profile before a live run.
 
 ```bash
-# TODO: Add the overall PortWatchman launch command after service integration.
-# TODO: Add service installation, start, status, and stop commands.
+python3 src/daemon/portwatchman.py --config config/service.json validate
+# After preparing/reviewing a local profile as described in the Step 8 guide:
+sudo python3 src/daemon/portwatchman.py --config logs/test-service.json check
+sudo python3 src/daemon/portwatchman.py --config logs/test-service.json run
+# In another terminal:
+sudo python3 src/daemon/portwatchman.py status
 ```
 
-Until then, use the monitoring, policy, and access-control commands below.
+Ctrl+C or a service stop requests ordered cleanup: stop monitoring, drain the
+pipeline, release bridge targets, stop the controller, then restore saved bus
+defaults. Unexpected failure retains deny state for explicit recovery; existing
+authorised devices and controller-loss limitations still apply. Runtime ownership
+is exclusive and saved service arm state is bound to the boot that created it.
+The service scope is new USB connections after readiness; existing devices are
+inventoried without automatic reconciliation or revocation.
+
+After foreground verification, the installer creates a root-owned snapshot under
+`/opt/portwatchman`, private configs under `/etc/portwatchman` and a systemd unit:
+
+```bash
+sudo python3 scripts/install_service.py --config logs/test-service.json
+sudo systemd-analyze verify /etc/systemd/system/portwatchman.service
+sudo systemctl start portwatchman
+sudo systemctl status portwatchman --no-pager
+sudo journalctl -u portwatchman -n 60 --no-pager -o cat
+sudo systemctl stop portwatchman
+```
+
+Installation neither starts nor enables the unit. Installed code/configs are
+separate from the checkout; updates use the explicit `--update-code` installer
+mode after stopping the service. Automatic restart is disabled. See
+[Step 8 testing](docs/STEP8-TESTING.md) for profile setup, optional boot enablement,
+LSM mounting requirements, normal cleanup and failure recovery.
+
+The individual component commands below remain available for development testing.
+Stop other pipelines/controllers before running the service.
 
 ### Check prerequisites and policy
 
@@ -390,7 +425,8 @@ portwatchman/
 │   ├── enforcement.example.json     # Example with explicit bus list
 │   ├── lsm-bridge.example.json      # Illustrative rule-to-relative-file mapping
 │   ├── responses.json               # Default lock-only response plan
-│   └── responses.example.json       # Optional experimental response actions
+│   ├── responses.example.json       # Optional experimental response actions
+│   └── service.json                 # Pipeline profile; preview responses, optional LSM
 ├── src/
 │   ├── monitor/
 │   │   ├── usb_events.bt           # eBPF probe definitions
@@ -398,6 +434,7 @@ portwatchman/
 │   ├── policy/
 │   │   └── device_policy.py        # Identification, policy rules, and CLI
 │   ├── responses/                 # Response engine and descriptor-relative deletion
+│   ├── daemon/                    # Foreground supervisor, service config and runtime ownership
 │   └── enforcement/
 │       ├── usb_authorization.py    # Default-deny, authorise/revoke, enforce, reconcile
 │       ├── lsm_client.py           # Root Unix socket client
@@ -409,6 +446,7 @@ portwatchman/
 │   ├── test_usb_authorization.py
 │   ├── test_lsm_controller.py       # Native CLI safety tests after Linux build
 │   ├── test_responses.py           # Step 7 action/containment/stream regressions
+│   ├── test_service.py             # Config, readiness, supervision, ownership and recovery
 │   ├── test_lsm_bridge.py           # Socket client, bridge and resolver tests
 │   └── enforcement/                # Root-only BPF acceptance runner
 ├── docs/
@@ -417,19 +455,17 @@ portwatchman/
 │   ├── STEP4-TESTING.md
 │   ├── STEP5-TESTING.md
 │   ├── STEP6-TESTING.md
-│   └── STEP7-TESTING.md
+│   ├── STEP7-TESTING.md
+│   └── STEP8-TESTING.md
+├── scripts/
+│   └── install_service.py          # Explicit root-owned runtime snapshot installation
+├── systemd/
+│   └── portwatchman.service        # Readiness-aware unit; no automatic restart
 ├── logs/                           # Local output; created as needed, ignored
 └── build/                          # Local build/test files; ignored
 ```
 
-Planned additions — these paths are placeholders and may change during implementation:
-
-```text
-src/
-└── daemon/                         # Application lifecycle and integration
-config/
-└── <service-config>                # Format and filename to be decided
-```
+Step 8 source is prepared; running-service acceptance and broader recovery/evaluation are still pending.
 
 ## Testing
 
@@ -460,10 +496,15 @@ See [step 3 testing](docs/STEP3-TESTING.md), [step 4 testing](docs/STEP4-TESTING
 - [x] 5. Implement automatic USB access control.
 - [x] 6. Implement supplementary BPF-LSM enforcement.
 - [x] 7. Implement configurable responses (tested Ubuntu VM scope).
-- [ ] 8. Integrate components into a running service.
+- [ ] 8. Integrate components into a running service (implementation prepared; Ubuntu verification pending).
 - [ ] 9. Handle failures, recovery, and edge cases.
 - [ ] 10. Test and evaluate the complete solution.
 - [ ] 11. Stabilise the final demonstration.
+
+The Step 8 tree declares **300 tests**, including **49 new service cases**. These
+new cases and the running service have not been executed during Windows editing;
+the previously reported passing baseline remains 251 tests. See the Step 8 guide
+for the required unit, foreground and systemd checks.
 
 ## Scope and limitations
 
@@ -473,6 +514,7 @@ See [step 3 testing](docs/STEP3-TESTING.md), [step 4 testing](docs/STEP4-TESTING
 - BPF-LSM enforcement restricts new opens of configured regular file identities on verified USB-backed filesystems. It follows those identities through rename/hardlinks but does not automatically enrol replacement files. It does not cover existing data descriptors, mmap, raw-device access, whole volumes or all USB interfaces.
 - Vendor/product IDs and serial numbers are device-reported attributes and can be spoofed. A policy match does not authenticate physical identity.
 - The watcher processes new setup events; `reconcile` handles devices connected before startup and must currently be run by hand. Running it automatically on service start and after recovery remains planned.
-- Current JSON output supports development testing; durable audit logging and service supervision remain planned.
+- Step 8 adds process supervision and journal output, pending Ubuntu verification. Durable/tamper-resistant audit logging and broader recovery remain later work.
 - Step 7 session locking is verified through the live USB pipeline; best-effort file/trace cleanup and graceful poweroff were tested separately. An applied USB-triggered sequence combining every action was not manually tested. Force, immediate/SysRq and reboot modes remain unit-tested only. Reliable evidence erasure, RAM sanitisation and removal of host/snapshot copies are not established capabilities.
+- The Step 7 slow-action input bug is retained as a documented limitation: synchronous actions can delay reading later events beyond the two-second freshness limit, causing rejected closing records or missed subsequent responses. Default-deny remains separate; the service reports component failure and does not automatically restart to hide it.
 - Timing measurements inside VMware describe guest behaviour. They do not establish physical insertion latency or erase data retained by the Windows host or VM snapshots.

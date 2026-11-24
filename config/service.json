@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "policy": "config/allowlist.json",
+  "enforcement": "config/enforcement.json",
+  "responses": "config/responses.json",
+  "lsm": null,
+  "apply_responses": false,
+  "startup_timeout": 90,
+  "shutdown_timeout": 30,
+  "command_timeout": 60
+}

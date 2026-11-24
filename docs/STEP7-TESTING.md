@@ -27,6 +27,18 @@ force and immediate/SysRq power modes retain unit coverage only. Filesystem chec
 establish logical removal and selection boundaries, not forensic unrecoverability
 or RAM erasure. Overall service integration and evaluation remain later milestones.
 
+## Known slow-action limitation
+
+The response stage executes actions synchronously. A large/slow overwrite can
+delay reading legitimate later events until they exceed the two-second freshness
+limit. Closing records can be rejected, yielding `unexpected_end_of_input` and a
+failed outcome; another blocked-device event can miss its response (also subject
+to configured cooldown). Default-deny still controls the new USB device separately.
+The earlier small-fixture checks did not exercise this case. The proposed input
+reader fix was deliberately excluded; this remains a report limitation. Step 8
+does not change the response algorithm or conceal its failures. Keep demonstration
+fixtures small and distinguish those results from unverified larger workloads.
+
 ## Scope and prerequisites
 
 The response stage consumes **live enforcement output**, not saved JSON logs.
@@ -255,5 +267,6 @@ different environment or relevant source change.
 - [x] Step 6 integration and original bus defaults remain correct after cleanup.
 
 Do not mark Step 7 complete based on source review or a declared test count alone.
-Service installation, durable logs, worker supervision and full-system evaluation
-remain later milestones.
+Step 8 service integration is prepared separately, pending its own Ubuntu
+verification. Durable logs, broader recovery and full-system evaluation remain
+later milestones.

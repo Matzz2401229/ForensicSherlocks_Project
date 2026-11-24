@@ -1,0 +1,30 @@
+# Managed by the PortWatchman installer. Does not enable itself at boot.
+[Unit]
+Description=PortWatchman USB policy and response service
+After=local-fs.target systemd-udevd.service dbus.service
+Wants=dbus.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=root
+WorkingDirectory=/opt/portwatchman
+ExecStart=/usr/bin/python3 -u /opt/portwatchman/src/daemon/portwatchman.py --config /etc/portwatchman/service.json run
+RuntimeDirectory=portwatchman-service
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+StateDirectory=portwatchman
+StateDirectoryMode=0700
+Environment=PYTHONUNBUFFERED=1 PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1
+UnsetEnvironment=PYTHONPATH PYTHONHOME
+UMask=0077
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStartSec=270
+TimeoutStopSec=180
+Restart=no
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
