@@ -23,7 +23,6 @@ the [limitations](#limitations) describe the boundaries of its protection.
 - [Understand status and logs](#understand-status-and-logs)
 - [Troubleshooting and recovery](#troubleshooting-and-recovery)
 - [Update the installed tool](#update-the-installed-tool)
-- [Suggested demonstration](#suggested-demonstration)
 - [Limitations](#limitations)
 
 ## How it works
@@ -910,29 +909,6 @@ sudo systemctl start portwatchman
 Start only after checks pass and earlier saved arm state has been restored. The
 installer does not replace existing policies or enable/disable boot startup during
 an update. Change installed settings explicitly while stopped and validate them.
-
-## Suggested demonstration
-
-Use a test drive, an owned disposable fixture and a lock-only response plan.
-
-1. Show the inspected USB identity, selected bus and response plan.
-2. Start in response preview mode; show healthy readiness, then connect the matching
-   drive and confirm access.
-3. If file protection is enabled, show one restricted file denied, a control file
-   readable, and the increased denied-open counter.
-4. Stop normally. Back up the installed policy before a rejection demonstration.
-   To reuse the same drive, change only its rule's serial to a nonmatching value
-   while preserving the rule name used by LSM. Validate before restarting.
-5. With only the lock response applied, reconnect after readiness. Show the screen
-   lock, USB `authorized: 0`, and absence of its storage partition.
-6. Stop, restore the backed-up matching policy and preview setting, then validate.
-   Recover the already-blocked device using the matching authorise command if
-   needed. Show restored bus defaults, clean shutdown and boot enablement status.
-
-Deletion, sanitisation and power actions are optional demonstrations. Use separate
-disposable fixtures and preview them first; a shutdown request ends the recording
-session. Short fixtures avoid concealing the known long-action limitation described
-below. A successful demonstration is not a claim that the limitation has been fixed.
 
 ## Limitations
 
