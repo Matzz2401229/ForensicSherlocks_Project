@@ -4,7 +4,7 @@ PortWatchman is a Linux USB monitoring, allowlisting, and enforcement project de
 
 The intended behaviour is to keep newly connected USB devices blocked until their reported attributes satisfy the allowlist. Unapproved devices remain blocked and can trigger a configured response, such as session locking or shutdown.
 
-**Current implementation:** USB monitoring, device identification/allowlist decisions, and USB access control are implemented and tested. Access control sets default-deny on managed USB buses, authorises allowed devices after re-validating them, keeps unapproved devices blocked, and reconciles devices connected before it started. Supplementary selected-file BPF-LSM enforcement, its root-only Unix socket and opt-in Python bridge are implemented and verified in the recorded Ubuntu VM environment, including coordinated USB removal/reconnection and report-only failure handling. Step 8 service supervision and systemd installation are prepared, pending Ubuntu verification. Step 7 passed 251 unit tests and the manual Ubuntu VM checks recorded below, covering USB-triggered locking, bridge integration, isolated file/trace cleanup and graceful guest poweroff. The policy watcher on its own still reports `enforcement_applied: false`; device access changes only when its decisions are piped into the enforcement stage.
+**Current implementation:** USB monitoring, device identification/allowlist decisions, and USB access control are implemented and tested. Access control sets default-deny on managed USB buses, authorises allowed devices after re-validating them, keeps unapproved devices blocked, and reconciles devices connected before it started. Supplementary selected-file BPF-LSM enforcement, its root-only Unix socket and opt-in Python bridge are implemented and verified in the recorded Ubuntu VM environment, including coordinated USB removal/reconnection and report-only failure handling. Step 8 service supervision and systemd installation are verified in the recorded Ubuntu VM setup, including boot startup, ordered shutdown, crash detection and manual recovery. The combined suite passed 300 tests; the reduced Step 9 verification also passed within its documented scope. Step 7 passed 251 unit tests and the manual Ubuntu VM checks recorded below, covering USB-triggered locking, bridge integration, isolated file/trace cleanup and graceful guest poweroff. The policy watcher on its own still reports `enforcement_applied: false`; device access changes only when its decisions are piped into the enforcement stage.
 
 ## Architecture
 
@@ -108,7 +108,7 @@ Run the Bash commands from your clone's repository root in the Linux system unde
 cd '/path/to/portwatchman'
 ```
 
-### Integrated running service (Step 8 — verification pending)
+### Integrated running service (Step 8 — verified Ubuntu VM scope)
 
 The foreground launcher supervises the four-stage pipeline and an optional owned
 BPF-LSM controller. It reports readiness only after healthy monitoring passes
@@ -149,7 +149,9 @@ Installation neither starts nor enables the unit. Installed code/configs are
 separate from the checkout; updates use the explicit `--update-code` installer
 mode after stopping the service. Automatic restart is disabled. See
 [Step 8 testing](docs/STEP8-TESTING.md) for profile setup, optional boot enablement,
-LSM mounting requirements, normal cleanup and failure recovery.
+LSM mounting requirements, normal cleanup and failure recovery. See
+[Step 9 verification](docs/STEP9-TESTING.md) for duplicate-instance refusal,
+invalid startup configuration and repeated USB registration/removal checks.
 
 The individual component commands below remain available for development testing.
 Stop other pipelines/controllers before running the service.
@@ -456,7 +458,8 @@ portwatchman/
 │   ├── STEP5-TESTING.md
 │   ├── STEP6-TESTING.md
 │   ├── STEP7-TESTING.md
-│   └── STEP8-TESTING.md
+│   ├── STEP8-TESTING.md
+│   └── STEP9-TESTING.md
 ├── scripts/
 │   └── install_service.py          # Explicit root-owned runtime snapshot installation
 ├── systemd/
@@ -465,7 +468,9 @@ portwatchman/
 └── build/                          # Local build/test files; ignored
 ```
 
-Step 8 source is prepared; running-service acceptance and broader recovery/evaluation are still pending.
+Step 8 running-service acceptance and the reduced Step 9 verification are complete
+for the recorded Ubuntu VM setup. Broader evaluation and final demonstration
+preparation remain separate work.
 
 ## Testing
 
@@ -496,15 +501,25 @@ See [step 3 testing](docs/STEP3-TESTING.md), [step 4 testing](docs/STEP4-TESTING
 - [x] 5. Implement automatic USB access control.
 - [x] 6. Implement supplementary BPF-LSM enforcement.
 - [x] 7. Implement configurable responses (tested Ubuntu VM scope).
-- [ ] 8. Integrate components into a running service (implementation prepared; Ubuntu verification pending).
-- [ ] 9. Handle failures, recovery, and edge cases.
+- [x] 8. Integrate components into a running service (verified Ubuntu VM scope).
+- [x] 9. Handle failures, recovery, and edge cases (reduced verification scope; remaining limitations documented).
 - [ ] 10. Test and evaluate the complete solution.
 - [ ] 11. Stabilise the final demonstration.
 
-The Step 8 tree declares **300 tests**, including **49 new service cases**. These
-new cases and the running service have not been executed during Windows editing;
-the previously reported passing baseline remains 251 tests. See the Step 8 guide
-for the required unit, foreground and systemd checks.
+The operator reported **49 service tests** and **300 combined tests** passing in
+Ubuntu. Live checks verified foreground and installed allow/reject behaviour,
+USB-triggered locking, selected-file protection, normal cleanup, monitor-crash
+detection with retained deny state, manual recovery and automatic startup after
+reboot. Initial checks used kernel `7.0.0-38-generic`; boot startup and subsequent
+Step 9 checks used `7.0.0-43-generic`. No new full-suite run was reported after that
+kernel change. See [Step 8 evidence](docs/STEP8-TESTING.md#recorded-verification) and
+[Step 9 evidence](docs/STEP9-TESTING.md#recorded-results) for the exact scope.
+
+Step 9 also verified duplicate-instance refusal without disturbing the original
+service, rejection of an invalid configuration before arming, and three distinct
+USB registrations followed by coordinated removal. File denial and the readable
+control were directly checked on the first connection in that round; later
+connections have registration/removal evidence, not repeated file-access checks.
 
 ## Scope and limitations
 
@@ -514,7 +529,7 @@ for the required unit, foreground and systemd checks.
 - BPF-LSM enforcement restricts new opens of configured regular file identities on verified USB-backed filesystems. It follows those identities through rename/hardlinks but does not automatically enrol replacement files. It does not cover existing data descriptors, mmap, raw-device access, whole volumes or all USB interfaces.
 - Vendor/product IDs and serial numbers are device-reported attributes and can be spoofed. A policy match does not authenticate physical identity.
 - The watcher processes new setup events; `reconcile` handles devices connected before startup and must currently be run by hand. Running it automatically on service start and after recovery remains planned.
-- Step 8 adds process supervision and journal output, pending Ubuntu verification. Durable/tamper-resistant audit logging and broader recovery remain later work.
+- Step 8 process supervision, journal output, normal shutdown, monitor-crash recovery and boot startup are verified in the recorded VM setup. Runtime health does not independently detect a frozen pipeline stage. Durable/tamper-resistant audit logging, automatic startup reconciliation and broader recovery are outside the reduced Step 9 verification.
 - Step 7 session locking is verified through the live USB pipeline; best-effort file/trace cleanup and graceful poweroff were tested separately. An applied USB-triggered sequence combining every action was not manually tested. Force, immediate/SysRq and reboot modes remain unit-tested only. Reliable evidence erasure, RAM sanitisation and removal of host/snapshot copies are not established capabilities.
 - The Step 7 slow-action input bug is retained as a documented limitation: synchronous actions can delay reading later events beyond the two-second freshness limit, causing rejected closing records or missed subsequent responses. Default-deny remains separate; the service reports component failure and does not automatically restart to hide it.
 - Timing measurements inside VMware describe guest behaviour. They do not establish physical insertion latency or erase data retained by the Windows host or VM snapshots.

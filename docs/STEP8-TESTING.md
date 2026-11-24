@@ -1,8 +1,10 @@
 # Step 8: running service
 
-Status: implementation prepared on the service branch. Only static checks have
-been performed while editing on Windows; the new unit tests and all runtime checks
-below must be run manually in Ubuntu before marking Step 8 complete.
+Status: completed within the recorded Ubuntu 24.04 VMware test scope. The
+operator ran the unit suites and live foreground/systemd checks below. Results
+were supplied from Ubuntu; Windows editing did not execute the runtime tests.
+See [recorded verification](#recorded-verification) and the
+[reduced Step 9 verification](STEP9-TESTING.md) for evidence and remaining limits.
 
 ## Behaviour and scope
 
@@ -49,7 +51,7 @@ access for every device or previously opened file.
 
 After startup, supervision detects process exits and reported errors. An independent
 end-to-end progress watchdog for a frozen policy/enforcement/response process is not
-implemented; broader hang detection belongs to Step 9. Runtime `healthy` reflects
+implemented and remains a limitation outside the reduced Step 9 scope. Runtime `healthy` reflects
 the established pipeline state and failures the supervisor has observed.
 
 The service saves a companion ownership record for its arm state. Recovery refuses
@@ -79,8 +81,9 @@ python3 -m unittest discover -s tests -p 'test_service.py' -v
 python3 -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-The tree declares 300 tests, including 49 new service cases; these are counts,
-not passing results. The new service cases use fake children/commands and owned temporary files. Native
+The operator reported all 49 service tests passing (0.554 seconds), and all
+300 combined tests passing (2.703 seconds) on kernel `7.0.0-38-generic`. The service
+cases use fake children/commands and owned temporary files. Native
 Step 6 tests require the existing Linux controller build. No real service, USB write,
 screen lock or power command is started by the service unit cases.
 
@@ -241,20 +244,50 @@ kernel changed. Config changes are explicit; the installer does not replace an
 existing installed profile during a code update. Policy edits do not automatically
 revoke existing devices or re-enrol already processed connections.
 
+## Recorded verification
+
+The following results were supplied by the operator on 24 November 2026 from
+Ubuntu 24.04 in VMware. Initial service tests used kernel `7.0.0-38-generic` and
+bpftrace `v0.20.2`. The boot test loaded `7.0.0-43-generic`; the installed controller
+and selected-file enforcement worked on that boot without a reported rebuild.
+This is an observed compatibility result for these kernels, not a general kernel
+compatibility guarantee. No new complete unit-suite run was reported after reboot.
+
+| Check | Observed result |
+|---|---|
+| Automated suites | 49 service tests and 300 combined tests passed in Ubuntu |
+| Foreground approval | Service healthy; bus default 0; matching drive authorised and mounted |
+| Foreground rejection | Mismatched drive unauthorised with no block device; preview configuration used, then applied lock visibly tested |
+| Managed LSM | Controller started by supervisor; selected file denied, control and local hostname readable; denied-open counter increased; controller failures 0 |
+| Installation | Runtime snapshot and private configs installed; no start/enable requested; unit verification and installed preflight passed |
+| Installed approval/rejection | Matching drive protected; mismatched drive blocked and one successful applied lock recorded, with no LSM targets for rejection |
+| Normal stop | All five component exit codes 0; systemd success; targets released, restricted file readable, original bus default restored; no matching processes |
+| Monitor crash | Current monitor killed with SIGKILL; service failed with exit 1, monitor exit -9 and downstream failures; no leftover controller/monitor/bpftrace processes |
+| Recovery | Default-deny and saved original retained after crash; installed service restore returned default 0 to original 1 and cleared armed state |
+| Boot startup | Enabled unit started automatically on a different boot ID; five children healthy; newly connected matching drive received working file protection |
+| End of boot test | Unit stopped and disabled; systemd success; default restored to 1; selected file readable; no matching processes |
+
+The installed profile ended with preview responses, LSM enabled, and boot startup
+disabled. Original bus defaults must always be restored from saved state; the
+observed original value 1 is not a universal recovery value. Boot protection was
+tested with the USB disconnected until readiness and a logged-in desktop mounting
+the drive. It does not establish protection before startup or unattended mounting.
+
 ## Acceptance checklist
 
-- [ ] New service unit cases and combined suite pass in Ubuntu.
-- [ ] Foreground readiness, allow/reject, preview/applied lock and cleanup pass.
-- [ ] Optional controller/bridge is managed and released correctly.
-- [ ] Concurrent service ownership is refused; no leftover descendants remain.
-- [ ] Installed snapshot starts, reports readiness/status and logs through systemd.
-- [ ] Normal `systemctl stop` releases targets and restores original defaults.
-- [ ] Unexpected child failure is reported and saved deny state can be recovered.
-- [ ] Optional boot enablement is separately verified for the chosen profile.
+- [x] New service unit cases and combined suite pass in Ubuntu.
+- [x] Foreground readiness, allow/reject, preview configuration, applied lock and cleanup pass.
+- [x] Optional controller/bridge is managed and released correctly.
+- [x] Concurrent service ownership is refused; no leftover descendants remain.
+- [x] Installed snapshot starts, reports readiness/status and logs through systemd.
+- [x] Normal `systemctl stop` releases targets and restores original defaults.
+- [x] Unexpected child failure is reported and saved deny state can be recovered.
+- [x] Optional boot enablement is separately verified for the chosen profile.
 
-Step 9 covers broader recovery/edge cases; whole-system evaluation remains later
-work. Service supervision does not establish forensic erasure or eliminate the
-documented component limitations.
+The agreed [reduced Step 9 verification](STEP9-TESTING.md) is complete for its
+listed checks. Broader recovery, hang detection and whole-system evaluation remain
+outside that evidence. Service supervision does not establish forensic erasure or
+eliminate the documented component limitations.
 
 ## Implementation references
 
