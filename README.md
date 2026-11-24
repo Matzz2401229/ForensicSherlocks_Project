@@ -1,535 +1,933 @@
-# PortWatchman
+# PortWatchman User Manual
 
-PortWatchman is a Linux USB monitoring, allowlisting, and enforcement project developed for ICT3215 Digital Forensics at the Singapore Institute of Technology. It explores an event-driven approach to USB access control and configurable anti-forensic responses using eBPF, a user-space policy component, Linux USB authorisation, and supplementary BPF-LSM restrictions.
+PortWatchman controls newly connected USB devices on Linux. It keeps devices on
+selected USB buses blocked until their reported identity matches an allowlist.
+An unapproved device remains blocked and can trigger a configured response, such
+as locking the session. Optional BPF-LSM protection denies new opens of selected
+files on an approved USB drive.
 
-The intended behaviour is to keep newly connected USB devices blocked until their reported attributes satisfy the allowlist. Unapproved devices remain blocked and can trigger a configured response, such as session locking or shutdown.
+This guide is for users operating the tool in an Ubuntu virtual machine or
+reviewing its behaviour for a demonstration. PortWatchman is an academic prototype;
+the [limitations](#limitations) describe the boundaries of its protection.
 
-**Current implementation:** USB monitoring, device identification/allowlist decisions, and USB access control are implemented and tested. Access control sets default-deny on managed USB buses, authorises allowed devices after re-validating them, keeps unapproved devices blocked, and reconciles devices connected before it started. Supplementary selected-file BPF-LSM enforcement, its root-only Unix socket and opt-in Python bridge are implemented and verified in the recorded Ubuntu VM environment, including coordinated USB removal/reconnection and report-only failure handling. Step 8 service supervision and systemd installation are verified in the recorded Ubuntu VM setup, including boot startup, ordered shutdown, crash detection and manual recovery. The combined suite passed 300 tests; the reduced Step 9 verification also passed within its documented scope. Step 7 passed 251 unit tests and the manual Ubuntu VM checks recorded below, covering USB-triggered locking, bridge integration, isolated file/trace cleanup and graceful guest poweroff. The policy watcher on its own still reports `enforcement_applied: false`; device access changes only when its decisions are piped into the enforcement stage.
+## Contents
 
-## Architecture
+- [How it works](#how-it-works)
+- [Requirements and installation](#requirements-and-installation)
+- [Prepare your USB and configuration](#prepare-your-usb-and-configuration)
+- [Run from the terminal](#run-from-the-terminal)
+- [Install and operate the background service](#install-and-operate-the-background-service)
+- [Manage the allowlist and enrol a new USB](#manage-the-allowlist-and-enrol-a-new-usb)
+- [Optional protection for selected USB files](#optional-protection-for-selected-usb-files)
+- [Configure response actions](#configure-response-actions)
+- [Understand status and logs](#understand-status-and-logs)
+- [Troubleshooting and recovery](#troubleshooting-and-recovery)
+- [Update the installed tool](#update-the-installed-tool)
+- [Suggested demonstration](#suggested-demonstration)
+- [Limitations](#limitations)
 
-The intended end-to-end flow is:
+## How it works
 
-```mermaid
-flowchart TD
-    Service[Start PortWatchman service] --> Default[Set default-deny on selected USB buses]
-    Default --> USB[USB device connects while blocked]
-    USB --> Monitor[eBPF detects USB setup]
-    Monitor --> Identify[Read device identity from sysfs]
-    Identify --> Policy{Allowlist match?}
-    Policy -->|Yes| Allow[Revalidate identity and authorise device]
-    Policy -->|No| Block[Keep device blocked]
-    Allow --> LSM[Apply configured supplementary BPF-LSM restrictions]
-    Block --> Response[Run configured response]
-    LSM --> Log[Record outcome and continue monitoring]
-    Response --> Log
-```
+| When | PortWatchman does this |
+|---|---|
+| The service starts | Checks its configuration and prerequisites, starts the optional file-protection controller, and sets default-deny on the selected USB buses |
+| The pipeline becomes ready | Reports `service_ready` and healthy status; the installed systemd unit reports running |
+| A new USB connects | Reads its reported vendor ID, product ID and optional serial/port constraint |
+| The device matches the allowlist | Revalidates its identity and authorises the device |
+| An approved storage device mounts | Registers configured files with the optional BPF-LSM controller |
+| The device does not match | Keeps it blocked and sends the result to the response component |
+| A normal stop is requested | Releases file restrictions, stops components and restores the recorded original bus defaults |
+| A component fails unexpectedly | Reports failure, stops the remaining components and retains default-deny for explicit recovery |
 
-The currently implemented pipeline is:
+**Response preview does not disable USB enforcement.** A normal service run changes
+USB authorisation even with `apply_responses: false`. That setting previews only
+the response plan: for example, it reports a planned lock without locking the screen.
 
-```text
-USB event -> eBPF monitor -> JSON event -> device identification -> allow/block decision
-  -> re-validation -> USB authorisation (authorise or keep blocked)
-  -> optional BPF-LSM bridge -> selected-file registration after mount
-```
+Use the service with the test USB **disconnected until readiness**. Devices already
+connected retain their existing access and are not automatically re-evaluated or
+enrolled in file protection at startup. When using VMware, connect the USB to the
+Ubuntu guest through VMware's USB/removable-device controls. Guest enforcement
+does not protect the Windows host.
 
-## Development environment
+## Requirements and installation
 
-Development and live testing currently target one Ubuntu VM configuration:
+### Supported environment
 
-| Component | Validated environment |
-| --- | --- |
-| Guest operating system | Ubuntu 24.04.5 LTS |
-| Virtualisation | VMware on a Windows laptop, with USB passthrough |
-| Kernel | `7.0.0-38-generic`; `7.0.0-42-generic` for step 5 live tests |
-| Monitoring backend | bpftrace `0.20.2` |
-| BPF development tools | Clang `18.1.3`, libbpf `1.3.0` |
-| Python | Python 3.10 or later; standard library only for current components |
+| Requirement | Details |
+|---|---|
+| Operating system | Validated on Ubuntu 24.04 under VMware on Windows |
+| Kernel | Requires eBPF, BTF and the USB probe functions checked by the monitor; optional file protection also requires active BPF-LSM support |
+| Validated kernel examples | `7.0.0-38-generic` and `7.0.0-43-generic`; other environments need their own checks |
+| Python | Python 3.10 or later; application Python components use the standard library |
+| Monitor | bpftrace; the recorded environment used `0.20.2` |
+| Permissions | `sudo`/root for live monitoring, enforcement, service operation and controller access |
+| USB storage | An intended test drive; optional file protection requires a mounted filesystem and existing regular files |
 
-The kernel must support eBPF and expose BTF at `/sys/kernel/btf/vmlinux`. The supplementary BPF-LSM work also requires `bpf` in the active LSM list. Live monitoring requires root privileges.
+The application runs inside Linux. You may edit and push code on Windows, then
+pull it into Ubuntu, but do not run the Linux enforcement commands on Windows.
 
-This environment has been validated for the prototype. Compatibility with other kernels, distributions, and physical machines remains subject to testing. Enforcement inside the VM applies to devices connected to the Ubuntu guest.
+### Obtain the repository and dependencies
 
-Install the development dependencies in Ubuntu:
+All commands below use **Bash inside Ubuntu**. Replace every `REPLACE_WITH_...` or
+`/path/to/...` placeholder before running it. Start clone-based commands from the
+repository root; the installed `/opt/portwatchman` commands work from any directory.
 
 ```bash
 sudo apt update
-sudo apt install -y git python3 bpftrace clang llvm linux-tools-common build-essential libbpf-dev libelf-dev libjson-c-dev pkg-config
+sudo apt install -y git python3 bpftrace usbutils udisks2 clang llvm \
+  linux-tools-common build-essential pkg-config libbpf-dev libelf-dev libjson-c-dev
+
+git clone 'REPLACE_WITH_REPOSITORY_URL' portwatchman
+cd portwatchman
+mkdir -p logs
 ```
 
-### Build and test the supplementary BPF-LSM guard
+If the repository is already cloned, use `cd '/path/to/portwatchman'` instead.
+The native build dependencies are needed only when enabling file protection.
 
-Step 6 adds a guard for new opens of selected regular file identities on verified
-USB-backed filesystems. It includes a foreground C/libbpf controller, root-only
-Unix socket (ADD/REMOVE/LIST/STATUS/PREPARE_REMOVE/STOP), denial counters, target-lifetime checks,
-an opt-in Python bridge tied to USB connection IDs, and an explicit loopback test mode.
-Building requires Clang, GCC, bpftool, pkg-config, libbpf-dev, libelf-dev and
-libjson-c-dev. Generated headers, skeletons and binaries stay in the ignored build
-directory and are regenerated locally.
+Check the environment:
+
+```bash
+python3 --version
+uname -r
+bpftrace --version
+ls -l /sys/kernel/btf/vmlinux
+sudo python3 src/monitor/usb_monitor.py --check
+```
+
+Expect a `monitor_preflight` record with `status: passed`. Stop and resolve a failed
+preflight before starting enforcement.
+
+For optional file protection, also check:
+
+```bash
+bpftool version
+sudo cat /sys/kernel/security/lsm
+```
+
+The active LSM list must contain `bpf`. Ubuntu's `linux-tools-common` may supply a
+bpftool launcher that still needs tools for the running kernel. If it reports
+missing kernel tools, install the matching package **if available**:
+
+```bash
+sudo apt install "linux-tools-$(uname -r)"
+bpftool version
+```
+
+If the package is unavailable, obtain a working bpftool for that environment
+before building; the [upstream bpftool project](https://github.com/libbpf/bpftool)
+documents its standalone build. Do not assume that `apt install bpftool` has an
+installation candidate on Ubuntu. A missing `bpf` LSM entry requires a suitable
+kernel/boot configuration; installing bpftool alone does not enable it.
+
+### Configuration locations
+
+| Location | Purpose |
+|---|---|
+| Repository `config/` | Shipped defaults and examples |
+| Repository `logs/manual-*.json` | Local profiles created by this guide; ignored by Git |
+| `/opt/portwatchman` | Installed runtime snapshot |
+| `/etc/portwatchman` | Installed service, policy, enforcement, response and optional LSM configuration |
+| `/var/lib/portwatchman/enforcement-state.json` | Installed service's saved original bus defaults |
+| `/run/portwatchman/lsm_controller.sock` | Default root-only file-protection control socket |
+
+The shipped allowlist is empty and its default action is `block`. The shipped
+enforcement configuration selects buses automatically. For an initial demonstration,
+use an explicit selected-bus profile as below; a bus may also contain a mouse,
+keyboard or hub. Newly connecting peripherals on that bus are subject to its policy.
+
+The service profile selects these configuration files:
+
+| Field | Meaning |
+|---|---|
+| `policy` | Allowlist JSON file |
+| `enforcement` | Managed buses and saved-state location |
+| `responses` | Response plan JSON file |
+| `lsm` | Bridge JSON file, or `null` to disable selected-file protection |
+| `apply_responses` | Boolean; `false` previews responses, `true` executes the plan |
+| `startup_timeout` | Readiness timeout in seconds; default 90, allowed 1–120 |
+| `shutdown_timeout` | Pipeline drain timeout in seconds; default 30, allowed 1–60 |
+| `command_timeout` | Prerequisite command timeout in seconds; default 60, allowed 1–60 |
+
+Relative file paths in service profiles and enforcement state paths are resolved
+from the application code root, not the configuration file's directory. Use absolute
+paths when explicitly configuring an installed service. Keep one schema version
+(`schema_version: 1`) and use JSON booleans, not quoted strings.
+
+## Prepare your USB and configuration
+
+### Identify the intended device
+
+With PortWatchman stopped, connect your intended drive to Ubuntu and run:
+
+```bash
+lsusb
+python3 src/policy/device_policy.py list
+lsblk -o NAME,TRAN,SIZE,FSTYPE,MOUNTPOINTS
+```
+
+Find the drive's `device_identified` JSON record. Confirm its manufacturer/product
+and reported identity; do not select a VMware mouse, hub or root hub.
+
+| Value | Meaning |
+|---|---|
+| `usb_id`, for example `3-2` | Device's current USB topology path; use the actual value from the JSON inventory |
+| `bus`, for example `3` | Controller bus; its configuration name is `usb3` |
+| `device_address` | Enumeration address; this is **not** the `usb_id` |
+| `vendor_id`, `product_id`, `serial` | Reported attributes used by allowlist rules |
+| `/dev/sdX1` | Storage partition shown by `lsblk`; separate from the USB ID |
+| `USB_MOUNT` | Directory where that partition is mounted; separate from its block-device path |
+
+Device paths, addresses, partitions and mount directories can change. Rediscover
+them after reconnecting or changing VMware configuration.
+
+```bash
+USB_ID='REPLACE_WITH_DEVICE_USB_ID'
+python3 src/policy/device_policy.py inspect "$USB_ID" > logs/manual-device.json
+cat logs/manual-device.json
+```
+
+Continue only after inspection succeeds and the file describes the intended drive.
+
+### Generate a selected-bus profile
+
+This creates a matching allowlist, a lock-only response plan in preview mode,
+and a service profile. It writes local configuration only; it does not arm a bus.
+It refuses existing output files or saved arm state so an earlier profile is not
+silently overwritten. If you already have a profile, edit it deliberately instead.
+
+```bash
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+files = {
+    "policy": Path("logs/manual-allowlist.json"),
+    "enforcement": Path("logs/manual-enforcement.json"),
+    "responses": Path("logs/manual-responses.json"),
+    "service": Path("logs/manual-service.json"),
+}
+state = Path("logs/manual-enforcement-state.json")
+guarded = [*files.values(), state, Path(str(state) + ".service-owner.json")]
+if any(path.exists() for path in guarded):
+    raise SystemExit("Existing manual profile/state found; inspect and restore it before replacing it.")
+
+device = json.loads(Path("logs/manual-device.json").read_text())["device"]
+if device["is_root_hub"] or device["device_class"] == "09":
+    raise SystemExit("Select the intended storage device, not a hub.")
+rule = {
+    "name": "trusted-usb",
+    "vendor_id": device["vendor_id"],
+    "product_id": device["product_id"],
+}
+if device.get("serial"):
+    rule["serial"] = device["serial"]
+
+documents = {
+    "policy": {"schema_version": 1, "default_action": "block", "allowlist": [rule]},
+    "enforcement": {
+        "schema_version": 1,
+        "managed_buses": ["usb" + str(device["bus"])],
+        "state_file": str(state),
+    },
+    "responses": {
+        "schema_version": 1,
+        "cooldown_seconds": 30,
+        "actions": [{"type": "lock_session"}],
+    },
+    "service": {
+        "schema_version": 1,
+        "policy": str(files["policy"]),
+        "enforcement": str(files["enforcement"]),
+        "responses": str(files["responses"]),
+        "lsm": None,
+        "apply_responses": False,
+    },
+}
+for name, document in documents.items():
+    files[name].write_text(json.dumps(document, indent=2) + "\n")
+print("Created selected-bus profile: logs/manual-service.json")
+PY
+
+python3 src/daemon/portwatchman.py --config logs/manual-service.json validate
+sudo python3 src/daemon/portwatchman.py --config logs/manual-service.json check
+```
+
+Expect `valid: true` and `service_preflight_passed`. `validate` checks configuration;
+`check` runs prerequisite checks without arming the bus or leaving protection running.
+
+If a device has no serial, the generated rule matches its vendor/product pair.
+That permits other devices reporting the same pair. Serial matching narrows the
+rule but does not authenticate physical hardware.
+
+### Select the partition and mount directory
+
+Read the actual values from `lsblk`, then set them in the terminal you are using:
+
+```bash
+USB_PARTITION='/dev/REPLACE_WITH_USB_PARTITION'
+USB_MOUNT='/path/to/mounted/usb'
+findmnt -T "$USB_MOUNT" -o SOURCE,TARGET,FSTYPE
+```
+
+Confirm the result identifies the USB partition and its mount, not the Linux root
+filesystem. If authorised but not mounted, use `udisksctl mount -b "$USB_PARTITION"`
+and read the actual mount directory. Shell variables do not automatically carry
+over to another terminal.
+
+## Run from the terminal
+
+Unmount the drive successfully, then disconnect it:
+
+```bash
+udisksctl unmount -b "$USB_PARTITION"
+```
+
+Start the supervisor from the repository root:
+
+```bash
+sudo python3 src/daemon/portwatchman.py --config logs/manual-service.json run
+```
+
+Wait for `service_ready` before reconnecting the USB. In another terminal:
+
+```bash
+sudo python3 '/path/to/portwatchman/src/daemon/portwatchman.py' status
+lsblk -o NAME,TRAN,SIZE,FSTYPE,MOUNTPOINTS
+```
+
+The matching drive should be authorised and available to mount. An unlisted drive
+on the managed bus should remain unauthorised, with no usable storage partition;
+the response plan is reported but not applied in preview mode.
+
+Press **Ctrl+C in the supervisor terminal** to stop normally. Expect
+`service_stopped` with `ok: true` and `buses_restored: true`. Inspect bus state:
+
+```bash
+python3 src/enforcement/usb_authorization.py \
+  --config logs/manual-enforcement.json status
+```
+
+Expect `armed: false` and the recorded original bus default restored. A stopped
+service status reports `running: false`, `healthy: false` and a nonzero status-command
+exit code; that does not by itself mean shutdown failed.
+
+For a lock-only demonstration after preview, this foreground override enables the
+configured response plan for that run:
+
+```bash
+sudo python3 src/daemon/portwatchman.py \
+  --config logs/manual-service.json run --apply-responses
+```
+
+An unapproved connection can now lock the Ubuntu screen. Unlock normally to review
+the output. The override enables **all configured actions**, so review the response
+plan first if you changed it. Do not run standalone pipelines or another controller
+alongside the supervisor.
+
+## Install and operate the background service
+
+### Install once
+
+Stop any foreground run and restore its saved state before installation. If you
+want optional file protection, prepare it using the next relevant section before
+installing the profile.
+
+```bash
+sudo python3 scripts/install_service.py --config logs/manual-service.json
+sudo systemd-analyze verify /etc/systemd/system/portwatchman.service
+
+sudo python3 /opt/portwatchman/src/daemon/portwatchman.py \
+  --config /etc/portwatchman/service.json validate
+sudo python3 /opt/portwatchman/src/daemon/portwatchman.py \
+  --config /etc/portwatchman/service.json check
+```
+
+Installation copies the runtime and configuration; it does **not** start the
+service or enable boot startup. It leaves existing enablement unchanged. For an
+existing installation, use the [update procedure](#update-the-installed-tool).
+
+The installer writes absolute installed configuration paths and changes the
+installed enforcement state path to `/var/lib/portwatchman/enforcement-state.json`.
+The checkout and installed service therefore have separate configuration/state.
+Editing `config/` or `logs/` in the clone does not change the installed service.
+
+### Everyday commands
+
+| Task | Command |
+|---|---|
+| Start | `sudo systemctl start portwatchman` |
+| Inspect systemd status | `sudo systemctl status portwatchman --no-pager -l` |
+| Inspect application health | `sudo python3 /opt/portwatchman/src/daemon/portwatchman.py status` |
+| Stop normally | `sudo systemctl stop portwatchman` |
+| Inspect last exit result | `sudo systemctl show portwatchman -p Result -p ExecMainStatus` |
+| Read recent logs | `sudo journalctl -u portwatchman -n 100 --no-pager -o cat` |
+| Follow live logs | `sudo journalctl -u portwatchman -f -o cat` |
+| Check boot enablement | `systemctl is-enabled portwatchman` |
+
+Keep the USB disconnected at startup, wait for healthy readiness, then connect it.
+Normal `systemctl start` waits for pipeline readiness, not just creation of a Python
+process. Normal `systemctl stop` releases selected-file protection before restoring
+the saved bus defaults. Stop the service before unmounting if you do not need to
+keep monitoring other devices.
+
+### Enable actual responses
+
+```bash
+sudo systemctl stop portwatchman
+sudoedit /etc/portwatchman/service.json
+```
+
+Change `"apply_responses": false` to `"apply_responses": true`. Review the actions:
+
+```bash
+sudo python3 /opt/portwatchman/src/responses/responses.py \
+  --config /etc/portwatchman/responses.json validate
+sudo python3 /opt/portwatchman/src/daemon/portwatchman.py \
+  --config /etc/portwatchman/service.json validate
+sudo systemctl start portwatchman
+```
+
+Continue to startup only if validation succeeds. To return to preview, stop, set
+the value to `false`, validate and start again. Response settings are loaded at
+process start; changing the JSON alone does not update a running response process.
+
+### Start automatically at boot
+
+After verifying manual startup with preview responses and the intended bus mapping:
+
+```bash
+sudo systemctl enable portwatchman
+```
+
+This enables future boot startup; it does not start an inactive service now. After
+the next normal reboot, inspect status and the current boot's logs:
+
+```bash
+sudo systemctl status portwatchman --no-pager -l
+sudo journalctl -b -u portwatchman --no-pager -o cat
+```
+
+To stop and disable automatic startup:
+
+```bash
+sudo systemctl disable --now portwatchman
+```
+
+Boot startup does not guarantee protection before readiness or automatically
+process devices already present. Bus numbering can change. File protection still
+needs the approved USB filesystem to be mounted; unattended mounting is not provided.
+
+## Manage the allowlist and enrol a new USB
+
+### Rule matching
+
+Each rule requires a unique `name`, a quoted four-digit hexadecimal `vendor_id`
+and `product_id`. Optional `serial` and `usb_id` constraints narrow the match.
+Every constraint in a rule must match; the first matching rule wins. Serial matching
+is exact and case-sensitive. `usb_id` constrains a current port/topology path, not
+a permanent physical identity. The default action must remain `block`.
+
+These commands display identity and decisions without authorising a device:
+
+```bash
+sudo python3 /opt/portwatchman/src/policy/device_policy.py list
+
+USB_ID='REPLACE_WITH_CURRENT_USB_ID'
+sudo python3 /opt/portwatchman/src/policy/device_policy.py inspect "$USB_ID"
+
+sudo python3 /opt/portwatchman/src/policy/device_policy.py \
+  --policy /etc/portwatchman/allowlist.json evaluate "$USB_ID"
+```
+
+An `action: allow` policy result is a decision, not a write to the kernel. Its
+`enforcement_applied: false` is expected when using `evaluate`.
+
+### Enrol a device that has never been allowed
+
+Default-deny prevents normal device use; the USB identity attributes remain
+available for inspection. You can identify and enrol a blocked drive without
+temporarily allowing its storage. An applied response may lock the screen when
+it first connects; unlock and inspect it normally.
+
+1. Connect the intended drive and inspect it using `list` and `inspect` above.
+2. Stop the service before editing its configuration. This restores its bus
+   defaults, so future connections are no longer gated while it is stopped.
+3. Add a rule using the inspected values. Do not copy another drive's serial.
+
+```bash
+sudo systemctl stop portwatchman
+
+VENDOR_ID='REPLACE_WITH_4_HEX_DIGITS'
+PRODUCT_ID='REPLACE_WITH_4_HEX_DIGITS'
+SERIAL='REPLACE_WITH_EXACT_REPORTED_SERIAL'
+
+sudo python3 /opt/portwatchman/src/policy/device_policy.py \
+  --policy /etc/portwatchman/allowlist.json add-rule \
+  --name additional-trusted-usb \
+  --vendor-id "$VENDOR_ID" --product-id "$PRODUCT_ID" --serial "$SERIAL"
+
+sudo python3 /opt/portwatchman/src/policy/device_policy.py \
+  --policy /etc/portwatchman/allowlist.json validate
+sudo python3 /opt/portwatchman/src/daemon/portwatchman.py \
+  --config /etc/portwatchman/service.json validate
+```
+
+If no serial is reported, omit `--serial "$SERIAL"` and understand the broader match.
+For an existing rule, use `sudoedit /etc/portwatchman/allowlist.json`; duplicate rule
+names are rejected. Also confirm the new device's bus is in the installed
+`enforcement.json` `managed_buses` list. Stop and reconfigure explicitly if it is not.
+
+After successful validation, disconnect the blocked drive, start the service, wait
+for readiness and reconnect. The new connection is evaluated using the rule.
+Changing a rule does not automatically re-evaluate a connection already processed.
+An LSM rule is optional for each allowed device; add one separately if needed.
+
+To remove a rule while stopped:
+
+```bash
+sudo python3 /opt/portwatchman/src/policy/device_policy.py \
+  --policy /etc/portwatchman/allowlist.json remove-rule \
+  --name additional-trusted-usb
+```
+
+Keep LSM mappings consistent: every configured `allowlist_rule` must still name
+an existing policy rule. Update the bridge configuration or disable its `lsm`
+setting before removing its last mapping. Validate the complete service profile.
+Removing a rule alone does not revoke an already-authorised device.
+
+### Recover access to an already blocked device
+
+Restoring bus defaults does not authorise a device that is already blocked. With
+the service stopped and a matching policy, first preview, then explicitly apply:
+
+```bash
+sudo python3 /opt/portwatchman/src/enforcement/usb_authorization.py \
+  --config /etc/portwatchman/enforcement.json \
+  --policy /etc/portwatchman/allowlist.json authorize "$USB_ID"
+
+sudo python3 /opt/portwatchman/src/enforcement/usb_authorization.py \
+  --config /etc/portwatchman/enforcement.json \
+  --policy /etc/portwatchman/allowlist.json authorize "$USB_ID" --apply
+```
+
+This authorises according to policy but does not register LSM protection. Use a new
+connection through the running service when selected-file protection is required.
+
+## Optional protection for selected USB files
+
+This feature blocks **new data opens of configured file identities**. It does not
+make the entire drive inaccessible. The drive may be authorised and mounted while
+one selected file returns `Permission denied` and a control file remains readable.
+
+### Build the controller
+
+With the service stopped, run in the Ubuntu clone:
 
 ```bash
 bash src/enforcement/bpf/build.sh
 sudo src/enforcement/bpf/build/lsm_controller --check
-python3 -m unittest discover -s tests -p 'test_*.py' -v
-sudo python3 tests/enforcement/test_bpf_lsm.py --loopback
 ```
 
-For physical USB acceptance, first authorise/mount the intended test drive, verify
-its actual mount path, and use:
+Expect `lsm_preflight_passed`. A successful build does not start persistent
+enforcement. The service will start its own controller; do not start another one.
+
+### Create a disposable example and mapping
+
+Use the matching drive while it is authorised and mounted. Confirm `USB_MOUNT`
+with `findmnt`; replace the placeholder before running:
 
 ```bash
-lsblk -o NAME,TRAN,SIZE,FSTYPE,MOUNTPOINTS
-USB_MOUNT='/path/to/mounted/usb'
+export USB_MOUNT='/path/to/mounted/usb'
 findmnt -T "$USB_MOUNT" -o SOURCE,TARGET,FSTYPE
-sudo python3 tests/enforcement/test_bpf_lsm.py --usb "$USB_MOUNT"
+
+python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+import tempfile
+
+mount = Path(os.environ["USB_MOUNT"])
+if not mount.is_mount():
+    raise SystemExit("Expected the actual USB mount directory.")
+service_path = Path("logs/manual-service.json")
+service = json.loads(service_path.read_text())
+policy = json.loads(Path(service["policy"]).read_text())
+if not any(rule["name"] == "trusted-usb" for rule in policy["allowlist"]):
+    raise SystemExit("Expected the trusted-usb rule from the local manual profile.")
+lsm_path = Path("logs/manual-lsm.json")
+if lsm_path.exists() or service.get("lsm") is not None:
+    raise SystemExit("Existing file-protection configuration found; edit it explicitly.")
+
+fixture = Path(tempfile.mkdtemp(prefix="portwatchman-demo-", dir=mount))
+(fixture / "restricted.txt").write_text("Restricted demonstration file\n")
+(fixture / "control.txt").write_text("Readable control file\n")
+bridge = {
+    "schema_version": 1,
+    "socket_path": "/run/portwatchman/lsm_controller.sock",
+    "registration_timeout_seconds": 30,
+    "on_error": "report",
+    "rules": [{
+        "allowlist_rule": "trusted-usb",
+        "protected_paths": [f"{fixture.name}/restricted.txt"],
+    }],
+}
+lsm_path.write_text(json.dumps(bridge, indent=2) + "\n")
+service["lsm"] = str(lsm_path)
+service_path.write_text(json.dumps(service, indent=2) + "\n")
+print("Fixture:", fixture)
+print("Restricted:", fixture / "restricted.txt")
+print("Control:", fixture / "control.txt")
+PY
+
+python3 src/daemon/portwatchman.py --config logs/manual-service.json validate
+sudo python3 src/daemon/portwatchman.py --config logs/manual-service.json check
 ```
 
-Replace the mount-directory placeholder with the USB filesystem's actual mounted directory, not its block-device path. The runner creates and removes an owned fixture
-directory; it does not select pre-existing user files. See
-[step 6 testing](docs/STEP6-TESTING.md) for manual tests, controls, and scope.
-Step 6 passed the Ubuntu build, all 181 tests, loopback and physical USB checks,
-live bridge registration/reconnect, rejection and report-only controller-loss tests.
-Another environment must rerun acceptance; a Python suite alone does not prove attachment. The guard follows file identity,
-not replacement pathnames; it does not cover existing data descriptors, raw devices,
-mount operations, mmap, HID interfaces, or every hotplug race.
+`protected_paths` are relative to the USB filesystem root, not `/media/...` paths.
+Each must identify an existing regular file; symlink paths and `..` are refused.
+The `allowlist_rule` name must match the policy rule exactly. Multiple files can
+be listed; the current bridge configuration allows at most 128 protected paths.
 
-Held file references keep protected mounts busy. With the Python bridge running,
-use `sudo python3 src/enforcement/lsm_client.py PREPARE_REMOVE CONNECTION_ID`, wait
-for `lsm_bridge_prepared_for_removal`, then unmount normally before disconnecting.
-This deliberately ends protection for that connection and lets the same pipeline
-register a new generation after reconnecting. The guide includes a live-status
-lookup to select the current connection without copying an obsolete ID.
+`on_error: report` reports incomplete protection without deliberately deauthorising
+the device; the supervisor treats the error as a service failure and cleans up.
+The alternative `deauthorize` attempts to revoke device access on bridge error and
+can interrupt USB I/O. Neither option eliminates the interval between authorisation,
+mounting and registration, or guarantees protection after controller exit.
 
-## Run the project
-
-Run the Bash commands from your clone's repository root in the Linux system under test. Replace the quoted path with its actual location:
+For a first installation, install this updated local profile using the installer.
+For an installation originally created from this manual's matching profile, stop
+the service, copy the new bridge config, and edit the installed service profile:
 
 ```bash
-cd '/path/to/portwatchman'
-```
-
-### Integrated running service (Step 8 — verified Ubuntu VM scope)
-
-The foreground launcher supervises the four-stage pipeline and an optional owned
-BPF-LSM controller. It reports readiness only after healthy monitoring passes
-through every stage. `run` applies USB authorisation; response actions remain a
-preview unless explicitly enabled. The shipped service profile has no LSM bridge
-and preview responses. Prepare your own selected-bus profile before a live run.
-
-```bash
-python3 src/daemon/portwatchman.py --config config/service.json validate
-# After preparing/reviewing a local profile as described in the Step 8 guide:
-sudo python3 src/daemon/portwatchman.py --config logs/test-service.json check
-sudo python3 src/daemon/portwatchman.py --config logs/test-service.json run
-# In another terminal:
-sudo python3 src/daemon/portwatchman.py status
-```
-
-Ctrl+C or a service stop requests ordered cleanup: stop monitoring, drain the
-pipeline, release bridge targets, stop the controller, then restore saved bus
-defaults. Unexpected failure retains deny state for explicit recovery; existing
-authorised devices and controller-loss limitations still apply. Runtime ownership
-is exclusive and saved service arm state is bound to the boot that created it.
-The service scope is new USB connections after readiness; existing devices are
-inventoried without automatic reconciliation or revocation.
-
-After foreground verification, the installer creates a root-owned snapshot under
-`/opt/portwatchman`, private configs under `/etc/portwatchman` and a systemd unit:
-
-```bash
-sudo python3 scripts/install_service.py --config logs/test-service.json
-sudo systemd-analyze verify /etc/systemd/system/portwatchman.service
-sudo systemctl start portwatchman
-sudo systemctl status portwatchman --no-pager
-sudo journalctl -u portwatchman -n 60 --no-pager -o cat
 sudo systemctl stop portwatchman
+sudo install -o root -g root -m 600 logs/manual-lsm.json /etc/portwatchman/lsm.json
+sudoedit /etc/portwatchman/service.json
 ```
 
-Installation neither starts nor enables the unit. Installed code/configs are
-separate from the checkout; updates use the explicit `--update-code` installer
-mode after stopping the service. Automatic restart is disabled. See
-[Step 8 testing](docs/STEP8-TESTING.md) for profile setup, optional boot enablement,
-LSM mounting requirements, normal cleanup and failure recovery. See
-[Step 9 verification](docs/STEP9-TESTING.md) for duplicate-instance refusal,
-invalid startup configuration and repeated USB registration/removal checks.
-
-The individual component commands below remain available for development testing.
-Stop other pipelines/controllers before running the service.
-
-### Check prerequisites and policy
+Set `"lsm": "/etc/portwatchman/lsm.json"`. Ensure its rule name exists in the
+installed policy. Copy the freshly built controller and check the installed profile:
 
 ```bash
-sudo python3 src/monitor/usb_monitor.py --check
-python3 src/policy/device_policy.py validate
+sudo python3 scripts/install_service.py --update-code
+sudo python3 /opt/portwatchman/src/daemon/portwatchman.py \
+  --config /etc/portwatchman/service.json validate
+sudo python3 /opt/portwatchman/src/daemon/portwatchman.py \
+  --config /etc/portwatchman/service.json check
 ```
 
-The monitor check verifies prerequisites and probe availability. It does not load the monitoring program or prove live event delivery. The policy check validates `config/allowlist.json`.
+Changing the checkout's service JSON alone does not update the installation.
 
-### Run the current monitor-to-policy pipeline
+Unmount and disconnect the drive, start the service, wait for readiness, then
+reconnect. Mounting must occur within the configured registration timeout; use
+desktop automount or mount the currently verified partition yourself.
 
-Start with the test USB drive disconnected:
+### Inspect protection
+
+For the installed service:
 
 ```bash
-set -o pipefail
-sudo python3 src/monitor/usb_monitor.py |
-  python3 src/policy/device_policy.py watch
+sudo python3 /opt/portwatchman/src/enforcement/lsm_client.py STATUS
 ```
 
-Wait for a `policy_monitor_status` record with `healthy: true`, then connect the USB drive to Ubuntu through VMware. A successful USB setup produces a policy decision. The default policy has no allowlist rules, so unmatched devices receive a `block` decision.
-
-To test approval for your own drive, generate a matching local policy using
-[shared testing setup](docs/TESTING-SETUP.md), then run:
+Wait for `lsm_bridge_registered` with `protection_complete: true`, and confirm the
+expected file appears in `targets`. Copy its actual paths into the following:
 
 ```bash
-sudo python3 src/monitor/usb_monitor.py |
-  python3 src/policy/device_policy.py --policy logs/test-allow.json watch
+cat '/path/to/mounted/usb/REPLACE_WITH_FIXTURE/restricted.txt'
+cat '/path/to/mounted/usb/REPLACE_WITH_FIXTURE/control.txt'
+sudo python3 /opt/portwatchman/src/enforcement/lsm_client.py STATUS
 ```
 
-The shipped `config/allowlist.example.json` illustrates the policy format and does
-not identify an arbitrary user's drive. The generated test policy uses the attributes
-of the device you inspected instead.
+Expect the restricted file to be denied, the control readable, and `denied_opens`
+to increase. `enforcement_active: true` only means the controller is attached;
+an empty `targets` list means no selected files are registered.
 
-Press **Ctrl+C** to stop. Unmount any mounted USB filesystem before unplugging the drive. Check that the monitoring backend has exited:
+### Remove the USB while keeping the service running
+
+Protected file references can keep the mount busy. Read the current controller
+status and use the **full current connection_id**, not the USB ID or target ID:
 
 ```bash
-pgrep -af 'bpftrace.*usb_events[.]bt'
+CONNECTION_ID='REPLACE_WITH_FULL_CURRENT_CONNECTION_ID'
+sudo python3 /opt/portwatchman/src/enforcement/lsm_client.py \
+  PREPARE_REMOVE "$CONNECTION_ID"
 ```
 
-No matching process is expected after a normal stop.
-
-### Save policy decisions
+Expect `lsm_connection_prepared`, then `lsm_bridge_prepared_for_removal` in the
+service journal. Confirm no active targets remain for that connection. Protection
+has deliberately ended for that connection; now unmount the verified partition:
 
 ```bash
-mkdir -p logs
-sudo python3 src/monitor/usb_monitor.py |
-  python3 src/policy/device_policy.py watch > logs/device-decisions.jsonl
+udisksctl unmount -b "$USB_PARTITION"
 ```
 
-From another terminal:
+Disconnect only after unmount succeeds. Reconnection is a new generation and should
+receive a new `connection_id` and registration. `prepared_connections` contains
+bounded recent removal markers; those are not active protected targets. If you do
+not need continued monitoring, stopping the whole service normally before unmounting
+is the simpler alternative. Do not send the controller `STOP` while its owning
+service is running; use `systemctl stop portwatchman` for normal shutdown.
 
-```bash
-tail -f logs/device-decisions.jsonl
-```
+## Configure response actions
 
-Output uses newline-delimited JSON: one JSON record per line. The `logs/` directory is ignored by Git.
+The response plan runs on a qualifying blocked-device result, not on an approved
+connection or merely on a file-open denial. It uses a global cooldown within the
+response process (default 30 seconds), so another blocked device during that window
+may have its response suppressed while remaining blocked.
 
-### Run the monitor independently
+| Action | Configuration | Effect when applied |
+|---|---|---|
+| `lock_session` | `{"type":"lock_session"}` | Runs `loginctl lock-sessions`; locks sessions on the Ubuntu guest |
+| `delete` | `paths`, `passes`, and top-level `allowed_roots` | Best-effort overwrite/removal of selected paths strictly inside chosen roots |
+| `sanitise` | `home_dirs`, `items`, `passes` | Cleans selected activity traces; `drop_caches` is system-wide cache dropping |
+| `power` | `mode`: `poweroff` or `reboot`; `method`: `graceful`, `force` or `immediate` | Requests guest shutdown/reboot using the configured method |
 
-```bash
-sudo python3 src/monitor/usb_monitor.py
-```
+Actions run in array order, each type may appear once, and `power` must be last.
+Overwrite `passes` accepts integers 1–7; more passes do not establish secure erasure
+on flash storage, snapshots or other retained copies. `force` skips normal unit
+shutdown; `immediate` uses SysRq and can bypass normal service cleanup. Use a
+lock-only plan for routine operation and disposable data for cleanup demonstrations.
 
-For a timed run:
-
-```bash
-sudo python3 src/monitor/usb_monitor.py --duration 60
-```
-
-Events include USB setup starting, setup completing or failing, disconnection, heartbeats, and monitoring diagnostics. Connection IDs distinguish successive connections at the same USB port.
-
-### Inspect and evaluate devices
-
-List devices first:
-
-```bash
-python3 src/policy/device_policy.py list
-```
-
-Select the device-level USB ID for your intended test drive, then replace the placeholder below. Keep this variable consistent across inspection and authorisation commands:
-
-```bash
-USB_ID='REPLACE_WITH_USB_ID'
-python3 src/policy/device_policy.py inspect "$USB_ID"
-python3 src/policy/device_policy.py evaluate "$USB_ID"
-```
-
-USB IDs and bus numbers can change across boots or VM configuration changes. Confirm the vendor/product IDs before selecting a device. `kernel_authorized` describes the existing kernel state; `action` describes the policy decision.
-
-### USB access control
-
-These commands change USB authorisation on the Linux system running them; inside a VM they affect devices connected to the guest. `arm`, `restore`, `authorize`, `revoke` and `reconcile` are dry runs unless `--apply` is supplied. **`enforce` writes by default; use `enforce --dry-run` to prevent writes.** Live writes need `sudo`. After `arm --apply`, any newly connected device (including a USB mouse or keyboard passed through to the VM) starts blocked until it is authorised, so keep the VMware console available. `restore --apply` undoes default-deny.
-
-Check the managed buses, then set default-deny and later restore it:
-
-```bash
-python3 src/enforcement/usb_authorization.py status
-sudo python3 src/enforcement/usb_authorization.py arm --apply
-sudo python3 src/enforcement/usb_authorization.py restore --apply
-```
-
-With default-deny armed, run the USB-authorisation pipeline so allowed devices are authorised and others stay blocked. Set `POLICY` to your own validated policy file and use it for both stages. The optional Step 6 bridge is enabled separately below:
-
-```bash
-POLICY='/path/to/your/allowlist.json'
-set -o pipefail
-sudo -v
-sudo python3 src/monitor/usb_monitor.py |
-  python3 src/policy/device_policy.py --policy "$POLICY" watch |
-  sudo python3 src/enforcement/usb_authorization.py --policy "$POLICY" enforce
-```
-
-`enforce` acts only on the buses in `config/enforcement.json`; its first record lists them and warns about any that are not armed. Wait for an `enforcement_monitor_status` record with `healthy: true`, then connect the device. Each device produces an `enforcement_result` with `action` (`allow` or `block`), `enforcement_applied`, the policy's `policy_reason`, and `enforcement_latency_ns`. Decisions that cannot be tied safely to the device now on the port, or that target an unmanaged bus, are reported as `enforcement_skipped` and change nothing; a failed sysfs write is reported as `enforcement_error`. Press **Ctrl+C** to stop; the stage ends with an `enforcement_stream_closed` record. Its exit status is non-zero if the upstream pipeline ended unexpectedly or any write failed.
-
-To handle devices that were already connected before the pipeline started:
-
-```bash
-sudo python3 src/enforcement/usb_authorization.py --policy "$POLICY" reconcile --apply
-```
-
-Single devices can also be authorised (after re-validation against the policy) or revoked:
-
-```bash
-sudo python3 src/enforcement/usb_authorization.py --policy "$POLICY" authorize "$USB_ID" --apply
-sudo python3 src/enforcement/usb_authorization.py revoke "$USB_ID" --apply
-```
-
-Find the current USB ID with `device_policy.py list` first. For reproducible tests,
-[shared setup](docs/TESTING-SETUP.md) generates policies from your inspected device
-and a selected-bus config; the [Step 5 guide](docs/STEP5-TESTING.md) uses those files.
-
-### Enable the supplementary BPF-LSM bridge
-
-Prepare and review the local test configuration and disposable files using
-[Step 6 preparation](docs/STEP6-TESTING.md#round-4--manual-socket-demonstration-and-bridge-fixture).
-The following uses its generated files, not the shipped lab-device example.
-Unmount/disconnect the test drive, then arm the same selected-bus configuration:
-
-```bash
-sudo python3 src/enforcement/usb_authorization.py \
-  --config logs/test-enforcement.json arm --apply
-```
-
-Terminal A, from the repository root:
-
-```bash
-sudo src/enforcement/bpf/build/lsm_controller --usb --serve
-```
-
-Terminal B, from the repository root:
-
-```bash
-set -o pipefail
-sudo -v
-sudo python3 src/monitor/usb_monitor.py |
-  python3 src/policy/device_policy.py --policy logs/test-allow.json watch |
-  sudo python3 src/enforcement/usb_authorization.py \
-    --config logs/test-enforcement.json --policy logs/test-allow.json \
-    enforce --lsm-config logs/test-lsm.json
-```
-
-Reconnect after healthy monitoring. The bridge waits for the authorised filesystem
-to mount, then registers the configured **relative file paths**. Expect
-`lsm_bridge_registered` with `protection_complete: true` before claiming protection.
-There is an access window between authorisation and registration. The generated
-config uses `on_error: report`: failures are reported while the USB remains
-authorised; this policy was live-tested. `deauthorize` is an explicit alternative
-with unit coverage, but its live behaviour has not been validated.
-
-Follow the [Step 6 guide](docs/STEP6-TESTING.md) for normal shutdown, coordinated
-removal, reconnect, failure testing and restoring the saved bus defaults. The bridge
-does not register files for direct `authorize` or `reconcile` calls.
-
-### Configurable responses (Step 7)
-
-The optional fourth stage reads fresh enforcement output and runs the configured
-ordered response plan for an unapproved USB connection. The default plan only
-requests session locking. Every response command is a dry run unless its own
-`--apply` flag is supplied; this differs from USB `enforce`, which writes by default.
-
-```bash
-python3 src/responses/responses.py validate
-python3 src/responses/responses.py trigger
-```
-
-To preview responses, append `python3 src/responses/responses.py watch` to the USB
-enforcement pipeline. Use the same validated local allowlist for `watch` and
-`enforce`. The updated enforcer adds boot, producer, timing and apply-mode metadata;
-stale logs and incomplete/unmatched records are rejected by the response watcher.
-Live responses also refuse upstream dry-run enforcement. A new producer requires a
-fresh response watcher. Step 6 events remain visible through this fourth stage.
-
-`config/responses.example.json` illustrates optional deletion, trace-cleanup and
-power actions. Copy/review a local config before enabling them. Filesystem removal
-is best effort, refuses symlink roots/parents, nested mounts and multiple hard links,
-and can retain incomplete operations in a private recovery directory. It is not a
-guarantee of forensic erasure; dropping caches does not sanitise RAM.
-
-Step 7 passed all **251 unit tests** in the Ubuntu VM. Live tests verified
-USB-triggered session locking and approval without a response, with and without
-the Step 6 bridge. Separate fixture tests verified selected-file deletion, selected
-trace cleanup and cache dropping; graceful guest poweroff was manually observed.
-See [Step 7 testing](docs/STEP7-TESTING.md) for the evidence, input contract and limits.
-Force, immediate/SysRq and reboot modes have unit coverage but were not tested live.
-
-## Allowlist configuration
-
-The default policy is `config/allowlist.json`:
+A lock-only installed configuration is:
 
 ```json
 {
   "schema_version": 1,
-  "default_action": "block",
-  "allowlist": []
+  "cooldown_seconds": 30,
+  "actions": [{"type": "lock_session"}]
 }
 ```
 
-Each rule requires a unique `name`, a `vendor_id`, and a `product_id`. Optional `serial` and `usb_id` constraints narrow the match. All constraints in a rule must match; the first matching rule wins. Serial matching is exact and case-sensitive. Use the vendor/product IDs and serial reported by inspection when constructing a rule.
-
-The CLI can manage rules in the selected local policy file:
-
-```bash
-VENDOR_ID='REPLACE_WITH_4_HEX_DIGITS'
-PRODUCT_ID='REPLACE_WITH_4_HEX_DIGITS'
-SERIAL='REPLACE_WITH_INSPECTED_SERIAL'
-
-python3 src/policy/device_policy.py add-rule \
-  --name trusted-usb \
-  --vendor-id "$VENDOR_ID" \
-  --product-id "$PRODUCT_ID" \
-  --serial "$SERIAL"
-
-python3 src/policy/device_policy.py validate
-
-python3 src/policy/device_policy.py remove-rule --name trusted-usb
-```
-
-Replace the placeholders before running the command. If the device has no serial, omit `--serial`; the match is then less specific. These commands edit the selected local JSON policy, not USB authorisation. The shared testing setup instead writes isolated policies under ignored `logs/`.
-
-The global `--policy` option goes **before** the command. The watcher reloads the policy for each new setup-completed event. Policy edits do not currently revoke existing access or re-evaluate previously processed connections.
-
-## Access-control configuration
-
-`config/enforcement.json` selects the buses that receive default-deny and where the original bus settings are saved:
+For optional cleanup, the following is a **template**. Replace the paths with
+owned disposable directories and review the scope before enabling it:
 
 ```json
 {
   "schema_version": 1,
-  "managed_buses": "auto",
-  "state_file": "logs/enforcement-state.json"
+  "cooldown_seconds": 30,
+  "allowed_roots": ["/absolute/path/to/disposable-demo"],
+  "actions": [
+    {"type": "lock_session"},
+    {
+      "type": "delete",
+      "paths": ["/absolute/path/to/disposable-demo/selected"],
+      "passes": 1
+    },
+    {
+      "type": "sanitise",
+      "home_dirs": ["/absolute/path/to/disposable-home"],
+      "items": ["recent_files", "thumbnails", "shell_history", "trash"],
+      "passes": 1
+    },
+    {"type": "power", "mode": "poweroff", "method": "graceful"}
+  ]
 }
 ```
 
-`"auto"` manages every USB bus. This is the default because the same device can enumerate on a different controller across reconnects, which would bypass default-deny on an unmanaged bus. To manage specific buses, list them, for example `["usb2", "usb3"]` (see `config/enforcement.example.json`). The original `authorized_default` values are saved before any bus is changed, so `restore` returns the true originals even if `arm` runs more than once.
+Sanitisation item names are `recent_files`, `thumbnails`, `shell_history`, `trash`
+and `drop_caches`. `home_dirs` scopes the trace paths independently of deletion's
+`allowed_roots`; neither setting scopes the system-wide cache drop. A cache-only
+sanitisation action may omit `home_dirs`. Cache dropping is not RAM sanitisation.
 
-## Directory structure
-
-Current repository layout:
-
-```text
-portwatchman/
-├── README.md
-├── .gitattributes                  # Line-ending settings
-├── .gitignore
-├── config/
-│   ├── allowlist.json               # Default policy: block, no rules
-│   ├── allowlist.example.json       # Example lab-device rule
-│   ├── enforcement.json             # Access control: managed buses ("auto"), state file
-│   ├── enforcement.example.json     # Example with explicit bus list
-│   ├── lsm-bridge.example.json      # Illustrative rule-to-relative-file mapping
-│   ├── responses.json               # Default lock-only response plan
-│   ├── responses.example.json       # Optional experimental response actions
-│   └── service.json                 # Pipeline profile; preview responses, optional LSM
-├── src/
-│   ├── monitor/
-│   │   ├── usb_events.bt           # eBPF probe definitions
-│   │   └── usb_monitor.py          # Monitor supervision and JSON output
-│   ├── policy/
-│   │   └── device_policy.py        # Identification, policy rules, and CLI
-│   ├── responses/                 # Response engine and descriptor-relative deletion
-│   ├── daemon/                    # Foreground supervisor, service config and runtime ownership
-│   └── enforcement/
-│       ├── usb_authorization.py    # Default-deny, authorise/revoke, enforce, reconcile
-│       ├── lsm_client.py           # Root Unix socket client
-│       ├── lsm_bridge.py           # Opt-in policy/connection-to-target bridge
-│       └── bpf/                    # Step 6 guard, target resolver, socket controller and build script
-├── tests/
-│   ├── test_usb_monitor.py
-│   ├── test_device_policy.py
-│   ├── test_usb_authorization.py
-│   ├── test_lsm_controller.py       # Native CLI safety tests after Linux build
-│   ├── test_responses.py           # Step 7 action/containment/stream regressions
-│   ├── test_service.py             # Config, readiness, supervision, ownership and recovery
-│   ├── test_lsm_bridge.py           # Socket client, bridge and resolver tests
-│   └── enforcement/                # Root-only BPF acceptance runner
-├── docs/
-│   ├── TESTING-SETUP.md            # Portable device selection and local test configs
-│   ├── STEP3-TESTING.md
-│   ├── STEP4-TESTING.md
-│   ├── STEP5-TESTING.md
-│   ├── STEP6-TESTING.md
-│   ├── STEP7-TESTING.md
-│   ├── STEP8-TESTING.md
-│   └── STEP9-TESTING.md
-├── scripts/
-│   └── install_service.py          # Explicit root-owned runtime snapshot installation
-├── systemd/
-│   └── portwatchman.service        # Readiness-aware unit; no automatic restart
-├── logs/                           # Local output; created as needed, ignored
-└── build/                          # Local build/test files; ignored
-```
-
-Step 8 running-service acceptance and the reduced Step 9 verification are complete
-for the recorded Ubuntu VM setup. Broader evaluation and final demonstration
-preparation remain separate work.
-
-## Testing
-
-Run the automated tests from the repository root:
+To preview an installed plan without triggering it through a USB:
 
 ```bash
-python3 -m unittest discover -s tests -p 'test_*.py' -v
+sudo python3 /opt/portwatchman/src/responses/responses.py \
+  --config /etc/portwatchman/responses.json validate
+sudo python3 /opt/portwatchman/src/responses/responses.py \
+  --config /etc/portwatchman/responses.json trigger
 ```
 
-At completion of step 4, all **58 tests** passed in the Ubuntu VM. Live tests also verified USB reconnection monitoring, connection correlation, allowlist matches and mismatches, identification while unauthorised, and normal backend cleanup.
+Both commands avoid applying response actions. To test only a configured lock:
 
-At the Step 5 milestone, **130 tests** passed, including regression checks for the issues found in code review (device replacement during authorisation, uncorrelated block decisions, managed-bus scope, exit status, and write-failure reporting). These include degraded monitoring followed by a deliberate stop and underlying write/cleanup failures. The access-control tests use a simulated sysfs tree and need no root or USB device; four of them need POSIX file behaviour and are skipped on Windows. Live tests in the Ubuntu VM verified that default-deny keeps a newly connected drive blocked, that authorise and revoke change real device access, that the pipeline authorises an allowlisted drive automatically while an unlisted drive stays blocked, that reconcile authorises an allowed drive connected beforehand without revoking the VMware virtual mouse or hubs, and that restore returns every bus to its original setting.
+```bash
+sudo python3 /opt/portwatchman/src/responses/responses.py \
+  --config /etc/portwatchman/responses.json run-action lock_session --apply
+```
 
-The completed Step 6 revision passed **181 tests** in Ubuntu, including native CLI safety checks and Python socket/bridge/resolver tests. Live tests also verified safe removal/reconnection, rejection with the bridge enabled, normal cleanup and controller-loss reporting under `on_error: report`. Native tests require a compiled Linux controller; the separate root-only runner exercises kernel enforcement and socket authentication. The bridge is disabled unless `enforce --lsm-config FILE` is supplied; registration failure handling is an explicit configuration choice. See [step 6 testing](docs/STEP6-TESTING.md) for staged verification and the post-authorisation registration window.
+This locks the screen immediately. A manual `trigger --apply` would execute the
+entire configured plan immediately, including deletion or power actions, without
+waiting for USB input. Manual command invocations do not share cooldown state with
+the running response process.
 
-Step 7 passed **251 tests** in Ubuntu, including response containment, freshness/correlation, duplicate suppression and failure/interrupt regression checks. Live approval and rejection tests passed with the response stage applied and the Step 6 bridge both disabled and enabled. Approved devices received selected-file protection with no response; rejected devices stayed blocked and triggered a single lock without LSM registration. Restriction release, controller health, backend cleanup and restoration of bus defaults were verified.
+## Understand status and logs
 
-Separate disposable local-filesystem fixtures verified deletion of two selected files with an unchanged control, and sanitisation of nine trace files with three unchanged controls. Cache dropping completed successfully. Graceful poweroff was observed in VMware, followed by manual startup and a changed boot ID; an unattended upgrade delayed shutdown. The response's command duration is not total poweroff latency. See [Step 7 evidence](docs/STEP7-TESTING.md#recorded-verification) for tested limits.
+The service writes one JSON record per line to the terminal or systemd journal.
+Component records appear inside a `service_stage_event` wrapper with a `stage`
+and nested `event`. A record forwarded through two stages can be logged twice;
+check connection/target identity before interpreting that as two operations.
 
-See [step 3 testing](docs/STEP3-TESTING.md), [step 4 testing](docs/STEP4-TESTING.md), and [step 5 testing](docs/STEP5-TESTING.md) for detailed procedures. Treat device IDs in those guides as examples and rediscover the current topology before testing.
+| Record or field | Interpretation |
+|---|---|
+| `service_ready` | Startup readiness completed |
+| `running: true`, `healthy: true` | Supervisor is alive and no observed pipeline failure has invalidated its established running state |
+| `enforcement_result`, `action: allow` | Device decision/action; verify authorisation and the block device when checking actual access |
+| `action: block`, `reason: already_blocked` | Device was already unauthorised; `enforcement_applied: false` here does not mean it was allowed |
+| Device `kernel_authorized: false` inside an allow result | The identity snapshot may have been captured before authorisation; read current sysfs state to confirm |
+| `lsm_bridge_pending` | Waiting for the mounted filesystem and configured files |
+| `lsm_bridge_registered`, `protection_complete: true` | Files registered with the current controller |
+| `response_action`, `applied: false` | Response preview |
+| `response_action`, `applied: true`, `ok: true` | Action reported success; a power-command result is not proof of total shutdown latency |
+| `response_suppressed`, `reason: cooldown` | Response skipped due to cooldown; USB blocking remains separate |
+| `service_stopped`, `ok: true`, `buses_restored: true` | Normal cleanup and saved bus restoration completed |
+| `service_bus_state_retained` or failed stop | Inspect the failure and use the owning profile's recovery command |
 
-## Implementation progress
+Read the current USB state using rediscovered values:
 
-- [x] 1. Set up the development environment and shared repository.
-- [x] 2. Validate technical feasibility in the Ubuntu VM.
-- [x] 3. Implement USB event monitoring.
-- [x] 4. Implement device identification and allowlisting.
-- [x] 5. Implement automatic USB access control.
-- [x] 6. Implement supplementary BPF-LSM enforcement.
-- [x] 7. Implement configurable responses (tested Ubuntu VM scope).
-- [x] 8. Integrate components into a running service (verified Ubuntu VM scope).
-- [x] 9. Handle failures, recovery, and edge cases (reduced verification scope; remaining limitations documented).
-- [ ] 10. Test and evaluate the complete solution.
-- [ ] 11. Stabilise the final demonstration.
+```bash
+cat "/sys/bus/usb/devices/$USB_ID/authorized"
+grep -H . /sys/bus/usb/devices/usb*/authorized_default
+lsblk -o NAME,TRAN,SIZE,FSTYPE,MOUNTPOINTS
+```
 
-The operator reported **49 service tests** and **300 combined tests** passing in
-Ubuntu. Live checks verified foreground and installed allow/reject behaviour,
-USB-triggered locking, selected-file protection, normal cleanup, monitor-crash
-detection with retained deny state, manual recovery and automatic startup after
-reboot. Initial checks used kernel `7.0.0-38-generic`; boot startup and subsequent
-Step 9 checks used `7.0.0-43-generic`. No new full-suite run was reported after that
-kernel change. See [Step 8 evidence](docs/STEP8-TESTING.md#recorded-verification) and
-[Step 9 evidence](docs/STEP9-TESTING.md#recorded-results) for the exact scope.
+`authorized: 0` means the device is unauthorised; `1` means authorised. A managed
+bus default of `0` gates new connections; it does not revoke devices already
+authorised. These are Linux USB authorisation attributes, described in the
+[kernel USB authorisation documentation](https://docs.kernel.org/usb/authorization.html).
 
-Step 9 also verified duplicate-instance refusal without disturbing the original
-service, rejection of an invalid configuration before arming, and three distinct
-USB registrations followed by coordinated removal. File denial and the readable
-control were directly checked on the first connection in that round; later
-connections have registration/removal evidence, not repeated file-access checks.
+## Troubleshooting and recovery
 
-## Scope and limitations
+| Symptom | What to check or do |
+|---|---|
+| `Device or required attributes unavailable` | Run `list` again; the selected USB ID may be wrong, disconnected or now assigned to another device |
+| Drive is absent from `lsblk` | Check whether it is intentionally blocked and whether its inspected identity matches the selected policy |
+| Drive is allowed but file protection is pending | Check the current mount, existing relative paths and rule name; mount before the registration timeout |
+| Selected file remains readable | Confirm registration and active target identity; replacement files and pre-existing data descriptors are outside the guard's scope |
+| Unmount says `target is busy` | Use PREPARE_REMOVE for the current protected connection or stop the owning service; close other applications using the mount |
+| No screen lock | Confirm `apply_responses`, the lock action, the blocked result, cooldown and an available lockable session |
+| Ownership-lock error | An existing service/check/install/restore operation owns the runtime lock; inspect it rather than deleting the lock file |
+| Existing arm state or LSM socket refused | Identify and stop its owner, inspect logs, and restore with the exact original configuration |
+| `bpftool` unavailable or native preflight fails | Resolve tools, BTF and active BPF-LSM prerequisites before enabling file protection |
+| Invalid JSON or unknown field | Use boolean `true`/`false`, schema version 1 and supported fields; validate before starting |
+| `lsm_bridge_error` after controller exit | File protection no longer survives that controller; inspect and recover the owning service |
+| `response_input_error` after a long action | The known input-age limitation may have rejected delayed records; inspect failed service state and recover normally |
 
-- USB authorisation is integrated with policy decisions and controls whole devices. Per-interface controls are not implemented. The step 6 file-open guard does not control HID traffic or provide a general composite-device firewall.
-- Default-deny affects devices connected after `arm`. Devices already connected keep their access; `reconcile` authorises allowed ones but does not revoke the others.
-- Before authorising, the enforcement stage binds to the device instance, re-reads it and re-checks the policy, and writes only to that instance; a device that replaces it at the same port is never authorised. This relies on Linux refusing writes to a removed device's sysfs files (checked in [step 5 testing](docs/STEP5-TESTING.md)). It does not stop a device that copies an allowlisted identity.
-- BPF-LSM enforcement restricts new opens of configured regular file identities on verified USB-backed filesystems. It follows those identities through rename/hardlinks but does not automatically enrol replacement files. It does not cover existing data descriptors, mmap, raw-device access, whole volumes or all USB interfaces.
-- Vendor/product IDs and serial numbers are device-reported attributes and can be spoofed. A policy match does not authenticate physical identity.
-- The watcher processes new setup events; `reconcile` handles devices connected before startup and must currently be run by hand. Running it automatically on service start and after recovery remains planned.
-- Step 8 process supervision, journal output, normal shutdown, monitor-crash recovery and boot startup are verified in the recorded VM setup. Runtime health does not independently detect a frozen pipeline stage. Durable/tamper-resistant audit logging, automatic startup reconciliation and broader recovery are outside the reduced Step 9 verification.
-- Step 7 session locking is verified through the live USB pipeline; best-effort file/trace cleanup and graceful poweroff were tested separately. An applied USB-triggered sequence combining every action was not manually tested. Force, immediate/SysRq and reboot modes remain unit-tested only. Reliable evidence erasure, RAM sanitisation and removal of host/snapshot copies are not established capabilities.
-- The Step 7 slow-action input bug is retained as a documented limitation: synchronous actions can delay reading later events beyond the two-second freshness limit, causing rejected closing records or missed subsequent responses. Default-deny remains separate; the service reports component failure and does not automatically restart to hide it.
-- Timing measurements inside VMware describe guest behaviour. They do not establish physical insertion latency or erase data retained by the Windows host or VM snapshots.
+### Recover after a failed installed service
+
+The service intentionally retains default-deny after unexpected failure. It does
+not automatically restart. First inspect its journal, then stop any remaining
+components through the owner:
+
+```bash
+sudo journalctl -u portwatchman -n 100 --no-pager -o cat
+sudo systemctl stop portwatchman
+
+pgrep -af 'lsm_controller|bpftrace.*usb_events[.]bt|src/daemon/portwatchman[.]py.*run'
+```
+
+Continue only after its component processes have exited. Restore using the installed
+profile, not the checkout's separate state:
+
+```bash
+sudo python3 /opt/portwatchman/src/daemon/portwatchman.py \
+  --config /etc/portwatchman/service.json restore
+
+sudo python3 /opt/portwatchman/src/enforcement/usb_authorization.py \
+  --config /etc/portwatchman/enforcement.json status
+
+sudo systemctl reset-failed portwatchman
+```
+
+Expect `armed: false` and the saved original defaults restored. The original value
+need not be `1`; do not replace it with a guessed value. After resolving the cause,
+disconnect the test drive, start the service and wait for readiness before reconnecting.
+
+For a failed foreground run using this guide's local profile, the owning command is:
+
+```bash
+sudo python3 src/daemon/portwatchman.py --config logs/manual-service.json restore
+```
+
+Recovery refuses foreign/manual state or saved state from a different boot. If
+that occurs, inspect the saved ownership, original values and current bus mapping
+with the project maintainer before changing anything. **Do not delete saved state,
+ownership records or sockets to bypass a refusal.** A forced reboot/power action
+may leave such state. Normal shutdown/reboot is the supported routine path.
+
+## Update the installed tool
+
+The installed runtime is a snapshot. A Git pull does not update it, and code updates
+preserve installed configuration. From the reviewed Ubuntu clone:
+
+```bash
+sudo systemctl stop portwatchman
+git status
+git pull --ff-only
+```
+
+Handle local changes before pulling and use the intended release/branch. If native
+sources or the target kernel changed and you use file protection, rebuild and check:
+
+```bash
+bash src/enforcement/bpf/build.sh
+sudo src/enforcement/bpf/build/lsm_controller --check
+```
+
+Then update the runtime snapshot and check its installed profile:
+
+```bash
+sudo python3 scripts/install_service.py --update-code
+sudo python3 /opt/portwatchman/src/daemon/portwatchman.py \
+  --config /etc/portwatchman/service.json validate
+sudo python3 /opt/portwatchman/src/daemon/portwatchman.py \
+  --config /etc/portwatchman/service.json check
+sudo systemctl start portwatchman
+```
+
+Start only after checks pass and earlier saved arm state has been restored. The
+installer does not replace existing policies or enable/disable boot startup during
+an update. Change installed settings explicitly while stopped and validate them.
+
+## Suggested demonstration
+
+Use a test drive, an owned disposable fixture and a lock-only response plan.
+
+1. Show the inspected USB identity, selected bus and response plan.
+2. Start in response preview mode; show healthy readiness, then connect the matching
+   drive and confirm access.
+3. If file protection is enabled, show one restricted file denied, a control file
+   readable, and the increased denied-open counter.
+4. Stop normally. Back up the installed policy before a rejection demonstration.
+   To reuse the same drive, change only its rule's serial to a nonmatching value
+   while preserving the rule name used by LSM. Validate before restarting.
+5. With only the lock response applied, reconnect after readiness. Show the screen
+   lock, USB `authorized: 0`, and absence of its storage partition.
+6. Stop, restore the backed-up matching policy and preview setting, then validate.
+   Recover the already-blocked device using the matching authorise command if
+   needed. Show restored bus defaults, clean shutdown and boot enablement status.
+
+Deletion, sanitisation and power actions are optional demonstrations. Use separate
+disposable fixtures and preview them first; a shutdown request ends the recording
+session. Short fixtures avoid concealing the known long-action limitation described
+below. A successful demonstration is not a claim that the limitation has been fixed.
+
+## Limitations
+
+- Only selected buses are managed. Current startup handling covers new connections
+  after readiness; existing devices and pre-start access are not automatically
+  reconciled or revoked. There is no complete boot-time prevention guarantee.
+- Vendor/product IDs and serials are reported by devices and can be spoofed.
+  An allowlist match does not authenticate physical hardware.
+- USB authorisation controls whole devices. There is no per-interface policy or
+  general composite-device/HID firewall in this application.
+- File protection follows registered regular-file identities through rename/hardlinks,
+  but does not automatically enrol replacement files. It does not cover pre-existing
+  data descriptors, mmap, raw-device access or whole volumes. Authorisation/mounting
+  occurs before registration, and controller exit removes its restrictions.
+- The service does not mount filesystems. The verified boot use involves a desktop
+  session and a drive connected after readiness; unattended mounting is not provided.
+- Responses run synchronously. A long action can delay reading later events beyond
+  the two-second freshness limit, causing valid closes or later response triggers
+  to be rejected. USB default-deny remains separate; the service can report failure
+  and require manual recovery. The global cooldown can also suppress later responses.
+- There is no independent end-to-end watchdog for a frozen pipeline stage. Healthy
+  status reflects the established state and errors observed so far.
+- Cleanup is best effort. Flash wear levelling, host/VM snapshots and other copies
+  prevent a guarantee of forensic erasure. Dropping caches does not sanitise RAM.
+- Kernel/distribution compatibility, long-duration workloads, simultaneous devices
+  and forced-power-loss recovery are not comprehensively validated. Journal output
+  is not a tamper-resistant audit store. VMware results describe guest behaviour.
+
+For background on the optional kernel mechanism, see the
+[Linux BPF-LSM documentation](https://docs.kernel.org/bpf/prog_lsm.html).
