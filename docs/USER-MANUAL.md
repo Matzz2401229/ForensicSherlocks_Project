@@ -28,6 +28,38 @@ the [limitations](#limitations) describe the boundaries of its protection.
 
 ## How it works
 
+```mermaid
+flowchart TD
+    Start["Start PortWatchman"] --> Check["Check configuration and prerequisites"]
+    Check --> Default["Set default-deny on selected USB buses"]
+    Default --> Ready["Pipeline ready: wait for a new USB connection"]
+    Ready --> USB["USB connects and starts blocked"]
+    USB --> Monitor["eBPF detects USB setup"]
+    Monitor --> Identify["Read the device's reported identity"]
+    Identify --> Policy{"Allowlist match?"}
+
+    Policy -->|Yes| Revalidate{"Identity still valid and allowed?"}
+    Revalidate -->|Yes| Allow["Authorise the device"]
+    Revalidate -->|No| Refuse["Refuse authorisation and report the outcome"]
+    Allow --> LSM{"File protection configured for this rule?"}
+    LSM -->|Yes| Register["After mounting, register selected files with BPF-LSM"]
+    LSM -->|No| Log["Log outcomes and continue monitoring"]
+    Register --> Log
+    Refuse --> Log
+
+    Policy -->|No| Block["Keep the device blocked"]
+    Block --> Apply{"Actual responses enabled?"}
+    Apply -->|Yes| Response["Run the configured response plan, subject to cooldown"]
+    Apply -->|No| Preview["Report the planned response without applying it"]
+    Response --> Log
+    Preview --> Log
+    Log --> Ready
+```
+
+Selected-file protection begins only after successful registration. Component or
+registration failures follow the recovery behaviour described below: the service
+reports failure, stops its components and retains deny state for explicit recovery.
+
 | When | PortWatchman does this |
 |---|---|
 | The service starts | Checks its configuration and prerequisites, starts the optional file-protection controller, and sets default-deny on the selected USB buses |
