@@ -29,6 +29,7 @@ import re
 import sys
 import tempfile
 import time
+import uuid
 
 SCHEMA_VERSION = 1
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -633,7 +634,22 @@ def reconcile(controller, bus_manager, policy_path, apply=True):
             "buses": buses, "failures": failures, "devices": results}
 
 
-def process_stream(enforcer, stream, bridge=None):
+def response_stream_context(apply):
+    """Identify one live producer; response consumers must reject old/replayed streams."""
+    try:
+        boot_id = str(uuid.UUID(Path("/proc/sys/kernel/random/boot_id").read_text().strip()))
+    except (OSError, ValueError) as error:
+        raise EnforcementError(f"Cannot establish response-stream boot identity: {error}") from error
+    return {"boot_id": boot_id, "enforcement_instance_id": str(uuid.uuid4()), "enforcement_apply": apply}
+
+
+def response_record(record, context):
+    if context is None:
+        return record
+    return {**record, **context, "clock": "monotonic", "emitted_timestamp_ns": time.monotonic_ns()}
+
+
+def process_stream(enforcer, stream, bridge=None, response_context=None):
     """Enforce each NDJSON line from ``stream`` and end with an enforcement_stream_closed record.
 
     Returns 0 only for a deliberate stop (Ctrl+C here or upstream) or a clean upstream
@@ -641,6 +657,8 @@ def process_stream(enforcer, stream, bridge=None):
     is visible to whatever runs this stage.
     """
     interrupted = False
+    def send(record):
+        emit(response_record(record, response_context))
     try:
         for line in stream:
             if not line.strip():
@@ -653,22 +671,22 @@ def process_stream(enforcer, stream, bridge=None):
                 enforcer.input_errors += 1
                 record = {"type": "enforcement_input_error", "message": str(error)}
             if record is not None:
-                emit(record)
+                send(record)
             if bridge is not None:
                 if isinstance(incoming, dict):
                     for event in bridge.handle(incoming, record):
-                        emit(event)
+                        send(event)
                 for event in bridge.tick():
-                    emit(event)
+                    send(event)
     except KeyboardInterrupt:
         interrupted = True  # Ctrl+C is a deliberate stop, not an error
     reason, ok = enforcer.outcome(interrupted)
     if bridge is not None:
         for event in bridge.close(clean=ok):
-            emit(event)
+            send(event)
         enforcer.failures += bridge.failures
         reason, ok = enforcer.outcome(interrupted)
-    emit({"type": "enforcement_stream_closed", "reason": reason, "ok": ok,
+    send({"type": "enforcement_stream_closed", "reason": reason, "ok": ok,
           "failures": enforcer.failures, "input_errors": enforcer.input_errors})
     return 0 if ok else 1
 
@@ -683,6 +701,7 @@ def enforce(controller, bus_manager, policy_path, apply=True, lsm_config=None):
     # Enforcement relies on default-deny to keep new devices blocked; flag any bus not armed.
     unarmed = [bus for bus in buses if bus_manager.read_default(bus) != "0"]
     enforcer = DeviceEnforcer(controller, policy_path, apply=apply, managed_buses=buses)
+    response_context = response_stream_context(apply)
     bridge = None
     if lsm_config is not None:
         # Explicit opt-in only. Controller preflight happens before any USB authorisation.
@@ -696,12 +715,14 @@ def enforce(controller, bus_manager, policy_path, apply=True, lsm_config=None):
                 raise EnforcementError("Arm every managed bus before enabling the live LSM bridge")
             bridge = LsmBridge(bridge_config, controller.reader,
                                enforcer._ensure_blocked, apply=apply)
-            emit(bridge.start())
+            bridge_started = bridge.start()
         except Exception as error:
             raise EnforcementError(f"BPF-LSM bridge startup failed: {error}") from error
-    emit({"type": "enforcement_started", "apply": apply, "policy_revision": policy.revision,
-          "managed_buses": buses, "unarmed_buses": unarmed})
-    return process_stream(enforcer, sys.stdin, bridge=bridge)
+    emit(response_record({"type": "enforcement_started", "apply": apply, "policy_revision": policy.revision,
+                          "managed_buses": buses, "unarmed_buses": unarmed}, response_context))
+    if bridge is not None:
+        emit(response_record(bridge_started, response_context))
+    return process_stream(enforcer, sys.stdin, bridge=bridge, response_context=response_context)
 
 
 def make_parser():

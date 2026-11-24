@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "trigger": {
+    "include_skipped": false
+  },
+  "cooldown_seconds": 30,
+  "allowed_roots": [],
+  "actions": [
+    {
+      "type": "lock_session"
+    }
+  ]
+}
