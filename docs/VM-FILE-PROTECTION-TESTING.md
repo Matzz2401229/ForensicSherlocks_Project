@@ -24,7 +24,7 @@ sudo python3 tests/enforcement/test_bpf_lsm.py --loopback
 Expect branch `fix/bpf-lsm`, successful build/preflight, passing unit tests and both
 acceptance runs. The `--local` run creates only owned disposable files under
 `build/test-tmp` on the VM disk. It checks read/write EACCES, readable controls,
-multiple targets, removal, rename/replacement identity semantics, unlink expiry,
+multiple targets, removal, rename/replacement identity semantics, refused delete/replace/truncate,
 clean detachment, the existing-descriptor boundary and socket-owned registration.
 The local-files controller must reject USB removal commands without releasing its
 targets. Loopback tests preserve coverage of the old controller mode. A physical

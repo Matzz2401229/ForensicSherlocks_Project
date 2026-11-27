@@ -23,6 +23,7 @@ UNIT = Path("/etc/systemd/system/portwatchman.service")
 MARKER = ".portwatchman-install.json"
 FILES = (
     "src/daemon/portwatchman.py", "src/daemon/service_config.py", "src/daemon/service_runtime.py",
+    "src/daemon/service_summary.py",
     "src/monitor/usb_monitor.py", "src/monitor/usb_events.bt", "src/policy/device_policy.py",
     "src/enforcement/usb_authorization.py", "src/enforcement/lsm_client.py", "src/enforcement/lsm_bridge.py",
     "src/enforcement/lsm_local.py",

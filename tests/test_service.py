@@ -22,6 +22,10 @@ from service_config import Config, ServiceError, commands, load_config
 from service_runtime import Health, Host, Lease, Supervisor
 
 
+OLD_BOOT = "0f3c2a11-5d6e-4f70-8a91-b2c3d4e5f607"
+CURRENT_BOOT = "9a8b7c6d-5e4f-4a3b-9c2d-1e0f9a8b7c6d"
+
+
 def event(kind, **fields):
     return {"schema_version": 1, "type": kind, **fields}
 
@@ -575,13 +579,83 @@ class RecoveryTests(Fixture):
         restore.assert_called_once()
         self.assertFalse(marker.exists())
 
-    def test_old_boot_is_refused_without_writing_defaults(self):
-        state, marker, module = self.prepare(boot="old")
-        with mock.patch.object(service_runtime, "boot_id", return_value="current"), \
-                mock.patch.object(module, "restore") as restore, self.assertRaises(ServiceError):
-            service_runtime.restore_owned(object(), state)
+    def test_old_boot_state_is_set_aside_without_writing_defaults(self):
+        state, marker, module = self.prepare(boot=OLD_BOOT)
+        state.write_text(json.dumps({"schema_version": 1, "buses": {"usb4": {"original_default": "1"}}}))
+        with mock.patch.object(service_runtime, "boot_id", return_value=CURRENT_BOOT), \
+                mock.patch.object(module, "restore") as restore:
+            result = service_runtime.restore_owned(object(), state)
         restore.assert_not_called()
+        self.assertEqual(result["type"], "service_previous_boot_state_cleared")
+        self.assertFalse(result["buses_written"])
+        self.assertEqual(result["saved_buses"], {"usb4": {"original_default": "1"}})
+        self.assertFalse(state.exists() or marker.exists())
+        archived = [Path(path) for path in result["archived"]]
+        self.assertEqual([path.name for path in archived],
+                         ["state.json.previous-boot-0f3c2a11", "state.json.service-owner.json.previous-boot-0f3c2a11"])
+        self.assertTrue(all(path.exists() for path in archived))
+
+    def test_old_boot_marker_without_state_is_set_aside(self):
+        state, marker, module = self.prepare(boot=OLD_BOOT)
+        state.unlink()
+        with mock.patch.object(service_runtime, "boot_id", return_value=CURRENT_BOOT):
+            result = service_runtime.restore_owned(object(), state)
+        self.assertEqual(result["saved_buses"], {})
+        self.assertFalse(marker.exists())
+
+    def test_unverifiable_old_owner_is_still_refused(self):
+        for boot in ("old", "", None):
+            state, marker, module = self.prepare(boot=boot)
+            with mock.patch.object(service_runtime, "boot_id", return_value=CURRENT_BOOT), \
+                    mock.patch.object(module, "restore") as restore, self.assertRaises(ServiceError):
+                service_runtime.restore_owned(object(), state)
+            restore.assert_not_called()
+            self.assertTrue(marker.exists() and state.exists())
+
+    def test_owner_for_another_state_path_is_refused(self):
+        state, marker, module = self.prepare(boot=OLD_BOOT)
+        marker.write_text(json.dumps({"boot_id": OLD_BOOT, "state_file": "/elsewhere/state.json"}))
+        with mock.patch.object(service_runtime, "boot_id", return_value=CURRENT_BOOT), \
+                self.assertRaises(ServiceError):
+            service_runtime.restore_owned(object(), state)
         self.assertTrue(marker.exists())
+
+    def preflight_host(self, state, clear):
+        host = object.__new__(Host)
+        records = []
+        host.emit = records.append
+        host.clear_previous_boot = clear
+        host.enforcement = SimpleNamespace(state_file=state)
+        # Stop at the first step after the saved-state check.
+        host.manager = SimpleNamespace(discover=mock.Mock(side_effect=RuntimeError("past state check")))
+        return host, records
+
+    def test_run_preflight_sets_aside_previous_boot_state(self):
+        state, marker, _ = self.prepare(boot=OLD_BOOT)
+        host, records = self.preflight_host(state, clear=True)
+        with mock.patch.object(service_runtime, "boot_id", return_value=CURRENT_BOOT), \
+                self.assertRaisesRegex(RuntimeError, "past state check"):
+            host.preflight()
+        self.assertEqual(records[0]["type"], "service_previous_boot_state_cleared")
+        self.assertFalse(state.exists() or marker.exists())
+
+    def test_check_preflight_reports_previous_boot_state_without_changes(self):
+        state, marker, _ = self.prepare(boot=OLD_BOOT)
+        host, records = self.preflight_host(state, clear=False)
+        with mock.patch.object(service_runtime, "boot_id", return_value=CURRENT_BOOT), \
+                self.assertRaisesRegex(RuntimeError, "past state check"):
+            host.preflight()
+        self.assertEqual(records[0]["type"], "service_previous_boot_state_found")
+        self.assertTrue(state.exists() and marker.exists())
+
+    def test_current_boot_state_still_blocks_startup(self):
+        state, marker, _ = self.prepare(boot=CURRENT_BOOT)
+        state.write_text(json.dumps({"schema_version": 1, "buses": {}}))
+        host, records = self.preflight_host(state, clear=True)
+        with mock.patch.object(service_runtime, "boot_id", return_value=CURRENT_BOOT), \
+                self.assertRaisesRegex(ServiceError, "Existing arm state"):
+            host.preflight()
+        self.assertTrue(state.exists() and marker.exists())
 
     def test_restore_failure_retains_owner_for_retry(self):
         state, marker, module = self.prepare()
@@ -608,6 +682,62 @@ class RecoveryTests(Fixture):
                 mock.patch.object(service_runtime.os, "killpg") as kill, self.assertRaises(ServiceError):
             host.control(["fake"])
         kill.assert_called_once_with(12345, signal.SIGKILL)
+
+
+class RoutineLogTests(Fixture):
+    def relay(self, records, log_all=False):
+        output = []
+        supervisor = Supervisor(self.config, object(), output.append, log_all=log_all)
+        stream = io.BytesIO(b"".join(json.dumps(record).encode() + b"\n" for record in records))
+        destination = io.BytesIO()
+        destination.close = lambda: None
+        supervisor.relay("monitor" if records[0]["type"].startswith("monitor") else "lsm", stream, destination)
+        logged = [row["event"] for row in output if row["type"] == "service_stage_event"]
+        return logged, destination.getvalue().count(b"\n"), supervisor
+
+    def heartbeat(self, timestamp, **fields):
+        return event("monitor_heartbeat", timestamp_ns=timestamp, received_timestamp_ns=timestamp + 5,
+                     delivery_delay_ns=5, event_counts={"usb_setup_completed": timestamp}, session_id="s",
+                     degraded=False, reported_lost_events=0, **fields)
+
+    def test_unchanged_heartbeats_are_logged_once_but_all_forwarded(self):
+        records = [self.heartbeat(1), self.heartbeat(2), event("usb_setup_completed", usb_id="4-1"),
+                   self.heartbeat(3), self.heartbeat(4, )]
+        logged, forwarded, _ = self.relay(records)
+        self.assertEqual([row["type"] for row in logged], ["monitor_heartbeat", "usb_setup_completed"])
+        self.assertEqual(forwarded, 5)
+
+    def test_changed_heartbeat_is_logged(self):
+        records = [self.heartbeat(1), self.heartbeat(2)]
+        records[1]["reported_lost_events"] = 3
+        logged, _, supervisor = self.relay(records)
+        self.assertEqual(len(logged), 2)
+
+    def test_status_logged_on_denial_and_failure_seen_by_health(self):
+        def status(command, denied, failures=0):
+            return event("lsm_status", command_id=command, timestamp_ns=command, mode="local-files",
+                         denied_opens=denied, failures=failures, targets=[{"target_id": 1, "denied_opens": denied}])
+        records = [status(1, 0), status(2, 0), status(3, 0), status(4, 2), status(5, 2), status(6, 2, failures=1)]
+        logged, forwarded, supervisor = self.relay(records)
+        self.assertEqual([row["denied_opens"] for row in logged], [0, 2, 2])
+        self.assertEqual(logged[-1]["failures"], 1)
+        self.assertEqual(forwarded, 6)
+        self.assertIn("lsm_status", supervisor.health.failure())
+
+    def test_log_all_keeps_every_record(self):
+        logged, _, _ = self.relay([self.heartbeat(1), self.heartbeat(2), self.heartbeat(3)], log_all=True)
+        self.assertEqual(len(logged), 3)
+
+    def test_same_type_from_other_stage_is_not_filtered(self):
+        output = []
+        supervisor = Supervisor(self.config, object(), output.append)
+        for _ in range(3):
+            supervisor.relay("enforcement", io.BytesIO(json.dumps(event("lsm_status", failures=0)).encode() + b"\n"))
+        self.assertEqual(len(output), 3)
+
+    def test_run_accepts_log_all(self):
+        args = portwatchman.parser().parse_args(["run", "--log-all"])
+        self.assertTrue(args.log_all)
 
 
 if __name__ == "__main__":

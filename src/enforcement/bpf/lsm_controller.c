@@ -21,7 +21,8 @@ static int map_fd = -1;
 static enum pw_target_mode target_mode = PW_USB;
 static bool attached, output_failed;
 static unsigned failures;
-static uint64_t next_id = 1, retired_denials;
+static uint64_t next_id = 1;
+static struct target_stats retired; /* counters of removed targets */
 static volatile sig_atomic_t stop_requested, status_requested;
 static struct json_object *request_id, *current_request, *socket_reply;
 static bool socket_request, serving;
@@ -107,7 +108,7 @@ static void prepared_reply(const char *connection, unsigned removed, bool alread
     emit(obj);
 }
 
-static struct json_object *describe(const struct pw_target *target, uint64_t denials)
+static struct json_object *describe(const struct pw_target *target, const struct target_stats *stats)
 {
     struct json_object *obj = json_object_new_object();
     json_object_object_add(obj, "target_id", json_object_new_int64(target->id));
@@ -117,29 +118,30 @@ static struct json_object *describe(const struct pw_target *target, uint64_t den
     json_object_object_add(obj, "inode", json_object_new_int64(target->key.inode));
     json_object_object_add(obj, "mount_id", json_object_new_int64(target->mount_id));
     json_object_object_add(obj, "usb_id", *target->usb_id ? json_object_new_string(target->usb_id) : NULL);
-    json_object_object_add(obj, "denied_opens", json_object_new_int64(denials));
+    json_object_object_add(obj, "denied_opens", json_object_new_int64(stats->denied_opens));
+    json_object_object_add(obj, "denied_changes", json_object_new_int64(stats->denied_changes));
     json_object_object_add(obj, "connection_id", *target->connection_id ? json_object_new_string(target->connection_id) : NULL);
     json_object_object_add(obj, "device_address", json_object_new_int64(target->device_address));
     return obj;
 }
 
-static bool read_count(struct pw_target *target, uint64_t *count)
+static bool read_count(struct pw_target *target, struct target_stats *stats)
 {
-    struct target_stats stats = {0};
-    *count = 0;
-    if (target->mapped && bpf_map_lookup_elem(map_fd, &target->key, &stats)) {
+    memset(stats, 0, sizeof(*stats));
+    if (target->mapped && bpf_map_lookup_elem(map_fd, &target->key, stats)) {
         error_record("counter_read_failed", strerror(errno), target->id);
         stop_requested = 1;
         return false;
     }
-    *count = stats.denied_opens;
     return true;
 }
 
-static void target_event(const char *type, struct pw_target *target, const char *reason, uint64_t count)
+static void target_event(const char *type, struct pw_target *target, const char *reason,
+                         const struct target_stats *stats)
 {
+    static const struct target_stats none;
     struct json_object *obj = record(type);
-    json_object_object_add(obj, "target", describe(target, count));
+    json_object_object_add(obj, "target", describe(target, stats ? stats : &none));
     json_object_object_add(obj, "enforcement_active", json_object_new_boolean(attached));
     if (reason)
         json_object_object_add(obj, "reason", json_object_new_string(reason));
@@ -254,13 +256,13 @@ static int add_target(const char *path)
     }
     targets[slot] = candidate;
     if (attached)
-        target_event("lsm_target_added", &targets[slot], NULL, 0);
+        target_event("lsm_target_added", &targets[slot], NULL, NULL);
     return 0;
 }
 
 static bool remove_target(struct pw_target *target, const char *reason)
 {
-    uint64_t count;
+    struct target_stats count;
     if (!read_count(target, &count))
         return false;
     if (target->mapped && bpf_map_delete_elem(map_fd, &target->key)) {
@@ -268,8 +270,9 @@ static bool remove_target(struct pw_target *target, const char *reason)
         stop_requested = 1;
         return false;
     }
-    retired_denials += count;
-    target_event("lsm_target_removed", target, reason, count);
+    retired.denied_opens += count.denied_opens;
+    retired.denied_changes += count.denied_changes;
+    target_event("lsm_target_removed", target, reason, &count);
     pw_target_close(target); /* Drop the rule before releasing its inode/mount reference. */
     return true;
 }
@@ -338,9 +341,9 @@ static void status(void)
 {
     struct json_object *obj = record("lsm_status");
     struct json_object *items = json_object_new_array();
-    uint64_t total = retired_denials;
+    struct target_stats total = retired;
     for (int i = 0; i < PW_MAX_TARGETS; i++) {
-        uint64_t count;
+        struct target_stats count;
         if (!targets[i].used)
             continue;
         if (!read_count(&targets[i], &count)) {
@@ -348,8 +351,9 @@ static void status(void)
             json_object_put(obj);
             return;
         }
-        total += count;
-        json_object_array_add(items, describe(&targets[i], count));
+        total.denied_opens += count.denied_opens;
+        total.denied_changes += count.denied_changes;
+        json_object_array_add(items, describe(&targets[i], &count));
     }
     json_object_object_add(obj, "targets", items);
     struct json_object *prepared = json_object_new_array();
@@ -358,7 +362,8 @@ static void status(void)
             json_object_array_add(prepared, json_object_new_string(prepared_connections[i]));
     json_object_object_add(obj, "prepared_connections", prepared);
     json_object_object_add(obj, "enforcement_active", json_object_new_boolean(attached));
-    json_object_object_add(obj, "denied_opens", json_object_new_int64(total));
+    json_object_object_add(obj, "denied_opens", json_object_new_int64(total.denied_opens));
+    json_object_object_add(obj, "denied_changes", json_object_new_int64(total.denied_changes));
     json_object_object_add(obj, "failures", json_object_new_int(failures));
     json_object_object_add(obj, "rejected_clients", json_object_new_int(server.rejected_clients));
     json_object_object_add(obj, "rejected_requests", json_object_new_int(server.rejected_requests));
@@ -598,7 +603,7 @@ int main(int argc, char **argv)
         if (add_target(argv[i]))
             goto done;
     if (inspect) {
-        target_event("lsm_target_inspected", &targets[0], NULL, 0);
+        target_event("lsm_target_inspected", &targets[0], NULL, NULL);
         result = 0;
         goto done;
     }
@@ -647,7 +652,7 @@ int main(int argc, char **argv)
     attached = true;
     for (int i = 0; i < PW_MAX_TARGETS; i++)
         if (targets[i].used)
-            target_event("lsm_target_added", &targets[i], NULL, 0);
+            target_event("lsm_target_added", &targets[i], NULL, NULL);
     struct json_object *ready = record("lsm_ready");
     json_object_object_add(ready, "mode", json_object_new_string(mode_name()));
     json_object_object_add(ready, "scope", json_object_new_string("new data opens of selected file identities"));

@@ -400,6 +400,14 @@ Editing `config/` or `logs/` in the clone does not change the installed service.
 | Follow live logs | `sudo journalctl -u portwatchman -f -o cat` |
 | Check boot enablement | `systemctl is-enabled portwatchman` |
 
+The log shows the monitor heartbeat, its policy health echo and the file-protection
+status check only when their content changes (for example a new denied open or a
+failure); unchanged repeats are still checked but not logged. Add `--log-all` to a
+foreground `run` to see every record. For a foreground `run`, `--summary` prints one short
+readable line per important event (USB allowed or blocked, denied file opens,
+responses, problems and shutdown) instead of JSON. The installed service always logs
+JSON.
+
 Keep the USB disconnected at startup, wait for healthy readiness, then connect it.
 Normal `systemctl start` waits for pipeline readiness, not just creation of a Python
 process. Normal `systemctl stop` releases selected-file protection before restoring
@@ -448,6 +456,12 @@ To stop and disable automatic startup:
 ```bash
 sudo systemctl disable --now portwatchman
 ```
+
+Protection then stays on across reboots until you disable it. A normal shutdown
+stops the service cleanly; after a forced power-off, VMware reset or a `force`/
+`immediate` power response, the next boot sets the old boot's arm state aside and
+arms again instead of refusing to start. `systemctl stop` alone lasts only until
+the next boot; use `disable --now` to turn protection off for good.
 
 Boot startup does not guarantee protection before readiness or automatically
 process devices already present. Bus numbering can change. VM files must already
@@ -873,11 +887,14 @@ For a failed foreground run using this guide's local profile, the owning command
 sudo python3 src/daemon/portwatchman.py --config logs/manual-service.json restore
 ```
 
-Recovery refuses foreign/manual state or saved state from a different boot. If
-that occurs, inspect the saved ownership, original values and current bus mapping
-with the project maintainer before changing anything. **Do not delete saved state,
-ownership records or sockets to bypass a refusal.** A forced reboot/power action
-may leave such state. Normal shutdown/reboot is the supported routine path.
+Recovery refuses foreign/manual state. Saved service state from an **earlier boot**
+is different: USB default-authorisation values live in sysfs and every boot resets
+them, so there is nothing to write back. The next service start (or `restore`) sets
+that state aside as `<state file>.previous-boot-<id>` and reports
+`service_previous_boot_state_cleared`; `check` only reports
+`service_previous_boot_state_found`. State from the **current** boot is still
+refused unless its owner restores it. **Do not delete saved state, ownership records
+or sockets to bypass a refusal.**
 
 ## Update the installed tool
 
@@ -923,7 +940,8 @@ an update. Change installed settings explicitly while stopped and validate them.
 - USB authorisation controls whole devices. There is no per-interface policy or
   general composite-device/HID firewall in this application.
 - File protection follows registered regular-file identities through rename/hardlinks,
-  but does not automatically enrol replacement files. It does not cover pre-existing
+  but does not automatically enrol replacement files. While protected, a file cannot
+  be deleted, replaced by a rename or truncated, even by root. It does not cover pre-existing
   data descriptors, mmap, raw-device access or whole volumes. VM files are enrolled
   before service readiness; legacy USB-file mode registers after authorisation/
   mounting. Controller exit removes either mode's restrictions. No application

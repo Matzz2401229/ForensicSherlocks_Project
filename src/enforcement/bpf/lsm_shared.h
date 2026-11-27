@@ -8,7 +8,8 @@ struct target_identity {
 };
 struct target_stats {
     __u64 denied_opens;
+    __u64 denied_changes; /* refused delete, replace or truncate */
 };
 _Static_assert(sizeof(struct target_identity) == 16, "BPF/user-space key ABI mismatch");
-_Static_assert(sizeof(struct target_stats) == 8, "BPF/user-space counter ABI mismatch");
+_Static_assert(sizeof(struct target_stats) == 16, "BPF/user-space counter ABI mismatch");
 #endif

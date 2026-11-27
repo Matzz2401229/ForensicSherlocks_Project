@@ -19,13 +19,24 @@ class Reporter:
     def __init__(self):
         self.lock = threading.Lock()
         self.on_error = None
+        self.summary = None  # set for run --summary: short lines instead of JSON
+
+    def text(self, record):
+        if self.summary is not None:
+            try:
+                return self.summary.line(record)
+            except Exception:  # A formatting bug must never hide the record itself.
+                pass
+        return json.dumps({"schema_version": 1, "service_timestamp_ns": time.monotonic_ns(),
+                           **record}, separators=(",", ":"))
 
     def __call__(self, record):
         error = None
         with self.lock:
             try:
-                print(json.dumps({"schema_version": 1, "service_timestamp_ns": time.monotonic_ns(),
-                                  **record}, separators=(",", ":")), flush=True)
+                text = self.text(record)
+                if text is not None:
+                    print(text, flush=True)
             except (OSError, ValueError) as failure:
                 error = str(failure)
         if error and self.on_error:
@@ -69,13 +80,13 @@ def restore(config, emit):
         lease.close()
 
 
-def run(config, emit):
+def run(config, emit, log_all=False):
     require_linux_root()
     lease = Lease()
     lease.acquire()
     previous = {}
     try:
-        host = Host(config, emit)
+        host = Host(config, emit, clear_previous_boot=True)
         identity = {"pid": os.getpid(), "boot_id": boot_id(),
                     "process_start_ticks": process_identity(os.getpid()),
                     "apply_responses": config.apply_responses, "lsm_enabled": config.lsm_enabled,
@@ -89,7 +100,7 @@ def run(config, emit):
             if supervisor is not None:
                 data["children"] = {name: process.pid for name, process in supervisor.processes.items()}
             write_json(RUNTIME / "status.json", data)
-        supervisor = Supervisor(config, host, emit, state=save)
+        supervisor = Supervisor(config, host, emit, state=save, log_all=log_all)
         emit.on_error = supervisor.health.fail
         for sig in (signal.SIGTERM, signal.SIGINT):
             previous[sig] = signal.signal(sig, lambda _sig, _frame: supervisor.stop.set())
@@ -108,6 +119,8 @@ def parser():
     sub.add_parser("check", help="Check Linux/root, buses and probe prerequisites; no bus changes")
     foreground = sub.add_parser("run", help="Run the foreground service; USB authorisation is live")
     foreground.add_argument("--apply-responses", action="store_true", help="Override response preview with applied configured actions")
+    foreground.add_argument("--log-all", action="store_true", help="Also log unchanged heartbeat and status records")
+    foreground.add_argument("--summary", action="store_true", help="Print short readable lines for important events instead of JSON")
     sub.add_parser("status", help="Inspect root-owned runtime status, checking PID and boot identity")
     sub.add_parser("restore", help="Restore saved bus defaults after a failure, only when the service is stopped")
     return result
@@ -143,7 +156,10 @@ def main(argv=None):
             return 0
         if args.apply_responses:
             config = replace(config, apply_responses=True)
-        return run(config, emit)
+        if args.summary:
+            from service_summary import Summary
+            emit.summary = Summary()
+        return run(config, emit, log_all=args.log_all)
     except Exception as error:
         emit({"type": "service_error", "message": str(error)})
         return 1

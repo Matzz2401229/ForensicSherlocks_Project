@@ -4,6 +4,7 @@ import ctypes
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import stat
@@ -95,8 +96,46 @@ def owner_path(state_path):
     return Path(str(state_path) + ".service-owner.json")
 
 
+def previous_boot_owner(state_path):
+    """Return the service's owner record when it was written during an earlier boot."""
+    marker = owner_path(state_path)
+    if not marker.exists():
+        return None
+    owner = parse(marker.read_bytes())
+    if (isinstance(owner, dict) and owner.get("state_file") == str(state_path)
+            and isinstance(owner.get("boot_id"), str) and re.fullmatch(r"[0-9a-f-]{36}", owner["boot_id"])
+            and owner["boot_id"] != boot_id()):
+        return owner
+    return None
+
+
+def set_aside_previous_boot(state_path, owner):
+    """Archive arm state from an unclean shutdown; sysfs defaults reset at boot, so nothing is restored."""
+    from usb_authorization import load_state
+    state_path = Path(state_path)
+    try:
+        saved = load_state(state_path)
+        buses = saved["buses"] if saved else {}
+    except Exception:  # Unreadable old state is still archived.
+        buses = None
+    suffix = ".previous-boot-" + owner["boot_id"][:8]
+    archived = []
+    # Marker last, so an interrupted archive can be retried.
+    for path in (state_path, owner_path(state_path)):
+        if path.exists():
+            target = path.with_name(path.name + suffix)
+            os.replace(path, target)
+            archived.append(str(target))
+    return {"type": "service_previous_boot_state_cleared", "previous_boot_id": owner["boot_id"],
+            "saved_buses": buses, "archived": archived, "buses_written": False,
+            "message": "Arm state from an earlier boot was set aside; USB defaults reset at every boot"}
+
+
 def restore_owned(manager, state_path):
     from usb_authorization import restore
+    owner = previous_boot_owner(state_path)
+    if owner is not None:
+        return set_aside_previous_boot(state_path, owner)
     marker = owner_path(state_path)
     if marker.exists():
         owner = parse(marker.read_bytes())
@@ -166,6 +205,26 @@ def clean_orphans(known, emit):
     return False
 
 
+# Timer-driven records, logged only when their content (minus timestamps) changes.
+ROUTINE = {("monitor", "monitor_heartbeat"), ("policy", "policy_monitor_status"), ("lsm", "lsm_status")}
+VOLATILE = {"timestamp_ns", "received_timestamp_ns", "delivery_delay_ns", "command_id", "event_counts"}
+
+
+class RoutineFilter:
+    def __init__(self):
+        self.last = {}
+
+    def changed(self, stage, record):
+        key = (stage, record.get("type"))
+        if key not in ROUTINE:
+            return True
+        signature = {name: value for name, value in record.items() if name not in VOLATILE}
+        if self.last.get(key) == signature:
+            return False
+        self.last[key] = signature
+        return True
+
+
 class Health:
     def __init__(self, lsm=False, local_files=False):
         self.lock = threading.Lock()
@@ -224,9 +283,10 @@ class Health:
 
 
 class Host:
-    def __init__(self, config, emit):
+    def __init__(self, config, emit, clear_previous_boot=False):
         self.config = config
         self.emit = emit
+        self.clear_previous_boot = clear_previous_boot
         self.parts = components(config)
         self.policy, self.enforcement, self.responses, self.bridge = self.parts
         from usb_authorization import BusManager
@@ -259,7 +319,14 @@ class Host:
 
     def preflight(self):
         from usb_authorization import load_state
-        if load_state(self.enforcement.state_file) is not None or owner_path(self.enforcement.state_file).exists():
+        state_file = self.enforcement.state_file
+        owner = previous_boot_owner(state_file)
+        if owner is not None and self.clear_previous_boot:
+            self.emit(set_aside_previous_boot(state_file, owner))
+        elif owner is not None:
+            self.emit({"type": "service_previous_boot_state_found", "previous_boot_id": owner["boot_id"],
+                       "message": "Arm state from an earlier boot will be set aside when the service starts"})
+        elif load_state(state_file) is not None or owner_path(state_file).exists():
             raise ServiceError("Existing arm state found. Restore it with its owning configuration before starting the service")
         self.manager.discover()
         plan = commands(self.config)
@@ -347,7 +414,7 @@ class Host:
 
 
 class Supervisor:
-    def __init__(self, config, host, emit, state=None, notifier=notify, clock=time.monotonic):
+    def __init__(self, config, host, emit, state=None, notifier=notify, clock=time.monotonic, log_all=False):
         self.config, self.host, self.emit = config, host, emit
         self.state = state or (lambda _phase, _fields: None)
         self.notifier, self.clock = notifier, clock
@@ -356,6 +423,7 @@ class Supervisor:
         self.processes = {}
         self.threads = []
         self.arm_attempted = False
+        self.routine = None if log_all else RoutineFilter()
 
     def save_state(self, phase, fields):
         try:
@@ -391,7 +459,8 @@ class Supervisor:
                 if not isinstance(record, dict):
                     raise ServiceError(f"{stage} emitted a non-object record")
                 self.health.observe(stage, record)
-                self.emit({"type": "service_stage_event", "stage": stage, "event": record})
+                if self.routine is None or self.routine.changed(stage, record):
+                    self.emit({"type": "service_stage_event", "stage": stage, "event": record})
                 if destination is not None:
                     destination.write(raw)
                     destination.flush()

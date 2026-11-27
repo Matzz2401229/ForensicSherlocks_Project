@@ -55,9 +55,11 @@ implemented and remains a limitation outside the reduced Step 9 scope. Runtime `
 the established pipeline state and failures the supervisor has observed.
 
 The service saves a companion ownership record for its arm state. Recovery refuses
-foreign/manual state and state from a different boot. If a forced reboot leaves
-old state, inspect the bus mapping and saved state before recovery; do not delete
-state files to bypass the refusal. Saved originals may differ from `1`.
+foreign/manual state and current-boot state it does not own. State left by an
+earlier boot (forced reboot or power-off) is set aside as
+`<state file>.previous-boot-<id>` at the next start or `restore`, because every boot
+resets the sysfs defaults; nothing from the old boot is written back. Do not delete
+state files to bypass a refusal. Saved originals may differ from `1`.
 
 ## Known response limitation
 

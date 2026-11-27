@@ -132,6 +132,15 @@ def denied(path, flags=os.O_RDONLY):
         raise AssertionError(f"Restricted file opened successfully: {path}")
 
 
+def refused(change):
+    try:
+        change()
+    except OSError as error:
+        assert error.errno == errno.EACCES, f"Expected EACCES, got {error!r}"
+    else:
+        raise AssertionError("A protected file was changed")
+
+
 def check_rejected(mode, path):
     result = subprocess.run([str(BINARY), mode, "--inspect", str(path)],
                             capture_output=True, timeout=10, text=True)
@@ -204,18 +213,19 @@ def run_checks(mode, directory, loop_device=None):
     print("PASS: identity semantics survive rename; replacement not automatically enrolled; SIGTERM detaches", flush=True)
 
     client = Controller(mode, [files[1]])
+    other = directory / "other.txt"
+    other.write_bytes(b"replacement\n")
     try:
-        files[1].unlink()
-        with files[1].open("xb") as stream:
-            stream.write(b"PortWatchman fixture\n")
-        client.wait_for(lambda row: row["type"] == "lsm_target_removed" and row["reason"] == "target_unlinked")
-        readable(files[1])
+        for change in (files[1].unlink, lambda: other.replace(files[1]), lambda: os.truncate(files[1], 0)):
+            refused(change)
         state = client.request("status")
-        assert not state["targets"] and state["failures"] >= 1, state
-        client.stop(expected=1)
+        assert len(state["targets"]) == 1 and state["denied_changes"] >= 3 and state["failures"] == 0, state
+        client.stop()
     finally:
         client.release()
-    print("PASS: unlinked target expires; replacement accessible; degraded outcome retained", flush=True)
+        other.unlink()
+    readable(files[1])
+    print("PASS: delete, replace and truncate of a protected file refused; target kept; clean stop", flush=True)
 
     client = Controller(mode)
     try:
