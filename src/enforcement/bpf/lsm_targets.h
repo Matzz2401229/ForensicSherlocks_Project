@@ -17,7 +17,8 @@ struct pw_target {
     char connection_id[256];
     unsigned device_address;
 };
-int pw_target_open(const char *path, bool loop, struct pw_target *out, char error[256]);
+enum pw_target_mode { PW_USB, PW_LOOPBACK, PW_LOCAL };
+int pw_target_open(const char *path, enum pw_target_mode mode, struct pw_target *out, char error[256]);
 bool pw_target_alive(const struct pw_target *target, char reason[64]);
 void pw_target_close(struct pw_target *target);
 #endif

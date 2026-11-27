@@ -167,12 +167,13 @@ def clean_orphans(known, emit):
 
 
 class Health:
-    def __init__(self, lsm=False):
+    def __init__(self, lsm=False, local_files=False):
         self.lock = threading.Lock()
         self.flags = set()
         self.error = None
         self.closing = {}
         self.lsm = lsm
+        self.local_files = local_files
 
     def fail(self, message):
         with self.lock:
@@ -185,8 +186,8 @@ class Health:
             raise ServiceError(f"{stage} emitted an invalid event envelope")
         with self.lock:
             if stage == "lsm" and kind == "lsm_ready":
-                if record.get("mode") != "usb":
-                    self.error = "Controller did not start in USB mode"
+                if record.get("mode") != ("local-files" if self.local_files else "usb"):
+                    self.error = "Controller did not start in the configured file-protection mode"
                 self.flags.add("lsm")
             if stage == "monitor" and kind == "monitor_alive":
                 self.flags.add("monitor")
@@ -200,6 +201,8 @@ class Health:
                 self.flags.add("response_started")
             if stage == "enforcement" and kind == "lsm_bridge_started":
                 self.flags.add("bridge")
+            if stage == "local" and kind == "lsm_local_registered" and record.get("protection_complete") is True:
+                self.flags.add("local")
             if kind.endswith("_stream_closed") or kind in ("monitor_stopped", "lsm_stopped"):
                 self.closing[stage] = record
             failure = (kind.endswith("_error") or kind in ("monitor_loss", "monitor_diagnostic")
@@ -211,7 +214,7 @@ class Health:
     def ready(self):
         required = set(PIPELINE) | {"enforcement_started", "response_started"}
         if self.lsm:
-            required |= {"lsm", "bridge"}
+            required |= {"lsm", "local" if self.local_files else "bridge"}
         with self.lock:
             return self.error is None and required <= self.flags
 
@@ -228,6 +231,10 @@ class Host:
         self.policy, self.enforcement, self.responses, self.bridge = self.parts
         from usb_authorization import BusManager
         self.manager = BusManager(self.enforcement)
+        self.local_guard = None
+        if config.local_lsm:
+            from lsm_local import LocalFileGuard, load_local_config
+            self.local_guard = LocalFileGuard(load_local_config(config.local_lsm))
 
     def control(self, args):
         process = subprocess.Popen(args, cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -259,15 +266,21 @@ class Host:
         checked = self.control([*plan["monitor"], "--check"])
         if not any(isinstance(r, dict) and r.get("type") == "monitor_preflight" and r.get("status") == "passed" for r in checked):
             raise ServiceError("Monitor did not confirm a passed preflight")
-        if self.bridge:
+        if self.bridge or self.local_guard:
             binary = ROOT / "src/enforcement/bpf/build/lsm_controller"
             if not binary.is_file() or not os.access(binary, os.X_OK):
-                raise ServiceError("Build the native controller before enabling the LSM bridge")
-            if os.path.lexists(self.bridge.socket_path):
+                raise ServiceError("Build the native controller before enabling file protection")
+            socket_path = self.local_guard.config.socket_path if self.local_guard else self.bridge.socket_path
+            if os.path.lexists(socket_path):
                 raise ServiceError("An LSM socket already exists; stop its owner before starting this service")
             checked = self.control([str(binary), "--check"])
             if not any(isinstance(r, dict) and r.get("type") == "lsm_preflight_passed" for r in checked):
                 raise ServiceError("Controller did not confirm a passed preflight")
+            if self.local_guard:
+                for path in self.local_guard.config.protected_paths:
+                    checked = self.control([str(binary), "--local-files", "--inspect", path])
+                    if not any(isinstance(r, dict) and r.get("type") == "lsm_target_inspected" for r in checked):
+                        raise ServiceError(f"Controller did not validate VM file: {path}")
         from device_policy import DeviceReader
         reader = DeviceReader()
         inventory = []
@@ -299,7 +312,19 @@ class Host:
         return restore_owned(self.manager, self.enforcement.state_file)
 
     def controller_command(self):
+        if getattr(self, "local_guard", None):
+            return [str(ROOT / "src/enforcement/bpf/build/lsm_controller"), "--local-files", "--serve",
+                    "--socket", self.local_guard.config.socket_path]
         return [str(ROOT / "src/enforcement/bpf/build/lsm_controller"), "--usb", "--serve", "--socket", self.bridge.socket_path]
+
+    def register_local(self, deadline):
+        return self.local_guard.start(deadline=deadline)
+
+    def check_local(self, *, force=False):
+        if force:
+            self.local_guard.verify()
+        else:
+            self.local_guard.tick()
 
     def spawn(self, args, stdin):
         env = dict(os.environ)
@@ -326,7 +351,7 @@ class Supervisor:
         self.config, self.host, self.emit = config, host, emit
         self.state = state or (lambda _phase, _fields: None)
         self.notifier, self.clock = notifier, clock
-        self.health = Health(config.lsm is not None)
+        self.health = Health(config.lsm_enabled, local_files=config.local_lsm is not None)
         self.stop = threading.Event()
         self.processes = {}
         self.threads = []
@@ -401,6 +426,8 @@ class Supervisor:
                 code = process.poll()
                 if code is not None:
                     raise ServiceError(f"{stage} exited during startup with status {code}")
+            if self.config.local_lsm and "local" in self.health.flags:
+                self.host.check_local()
             if predicate():
                 return
             if self.clock() >= deadline:
@@ -485,9 +512,13 @@ class Supervisor:
             if self.stop.is_set():
                 raise StopRequested("Stop requested before starting components")
             startup_deadline = self.clock() + self.config.startup_timeout
-            if self.config.lsm:
+            if self.config.lsm_enabled:
                 self.spawn("lsm", self.host.controller_command())
                 self.wait_for(lambda: "lsm" in self.health.flags, max(0, startup_deadline - self.clock()))
+                if self.config.local_lsm:
+                    registered = self.host.register_local(startup_deadline)
+                    self.health.observe("local", registered)
+                    self.emit({"type": "service_stage_event", "stage": "local", "event": registered})
             if self.stop.is_set():
                 raise StopRequested("Stop requested before arming")
             self.arm_attempted = True  # Partial arm failures also own a recovery state.
@@ -498,12 +529,17 @@ class Supervisor:
             policy = self.spawn("policy", plan["policy"], enforce.stdin)
             self.spawn("monitor", plan["monitor"], policy.stdin)
             self.wait_for(self.health.ready, max(0, startup_deadline - self.clock()))
+            if self.config.local_lsm:
+                self.host.check_local(force=True)
             if not self.save_state("running", {"healthy": True}):
                 raise ServiceError(self.health.failure())
             self.emit({"type": "service_ready", "apply_responses": self.config.apply_responses,
-                       "lsm_enabled": self.config.lsm is not None, "scope": "new USB connections"})
+                       "lsm_enabled": self.config.lsm_enabled, "lsm_scope": self.config.lsm_scope,
+                       "scope": "new USB connections; configured VM files protected independently" if self.config.local_lsm else "new USB connections"})
             self.send_notify("READY=1\nSTATUS=USB pipeline ready")
             while not self.stop.wait(0.2):
+                if self.config.local_lsm:
+                    self.host.check_local()
                 if self.health.failure():
                     raise ServiceError(self.health.failure())
                 for name, process in self.processes.items():

@@ -148,12 +148,14 @@ def run_checks(mode, directory, loop_device=None):
         readable(path)
     check_rejected(mode, directory)
     check_rejected(mode, directory / "missing")
-    if mode == "--test-loopback":
+    if mode in ("--test-loopback", "--local-files"):
         alias = directory / "symlink"
         alias.symlink_to(files[0].name)
         check_rejected(mode, alias)
     # Host-root target must never be accepted in physical-USB mode.
     check_rejected("--usb", Path("/etc/hostname"))
+    if mode != "--local-files":
+        check_rejected("--local-files", files[0])
     print("PASS: invalid targets rejected; all fixture files readable before enforcement", flush=True)
 
     client = Controller(mode, [files[0]])
@@ -248,7 +250,74 @@ def run_checks(mode, directory, loop_device=None):
     finally:
         client.release()
     print("PASS: rejected/duplicate commands, oversized input and unexpected control EOF remain failures", flush=True)
-    socket_checks(mode, files, loop_device=loop_device)
+    if mode == "--local-files":
+        local_socket_checks(files)
+    else:
+        socket_checks(mode, files, loop_device=loop_device)
+
+
+def local_socket_checks(files):
+    from lsm_local import LocalFileGuard, LocalGuardConfig, LocalGuardError
+    parent = Path(tempfile.mkdtemp(prefix="portwatchman-local-test-", dir="/run"))
+    owner = parent.stat()
+    path = parent / "controller.sock"
+    controller = None
+    try:
+        controller = Controller("--local-files", socket_path=path)
+        client = LsmClient(str(path))
+        guard = LocalFileGuard(LocalGuardConfig(str(path), tuple(map(str, files[:2]))), client=client)
+        # An existing data descriptor is explicitly outside the new-open guard.
+        with files[0].open("rb") as existing:
+            registered = guard.start()
+            assert registered["protection_complete"] is True
+            assert existing.read() == b"PortWatchman fixture\n"
+            denied(files[0])
+            denied(files[0], os.O_WRONLY)
+            denied(files[1])
+            readable(files[2])
+        state = client.status()
+        assert state["mode"] == "local-files" and state["failures"] == 0
+        assert len(state["targets"]) == 2 and state["denied_opens"] >= 3
+        assert all(target["usb_id"] is None for target in state["targets"])
+        guard.verify()
+        # Manual removal must be detected; the manager never silently re-adds it.
+        target = state["targets"][0]
+        client.request("REMOVE", target_id=target["target_id"], connection_id=guard.owner_id)
+        try:
+            guard.verify()
+        except LocalGuardError:
+            pass
+        else:
+            raise AssertionError("A missing VM-file registration was not detected")
+        client.request("STOP")
+        closing = controller.wait_for(lambda row: row["type"] == "lsm_stopped")
+        assert closing["ok"] and controller.process.wait(timeout=10) == 0, closing
+        controller.release()
+        for file in files:
+            readable(file)
+        controller = Controller("--local-files", socket_path=path)
+        client = LsmClient(str(path))
+        guard = LocalFileGuard(LocalGuardConfig(str(path), (str(files[0]),)), client=client)
+        guard.start()
+        try:
+            client.request("PREPARE_REMOVE", connection_id=guard.owner_id)
+        except LsmClientError as error:
+            assert "unsupported_command" in str(error)
+        else:
+            raise AssertionError("USB removal command released VM files")
+        denied(files[0])
+        client.request("STOP")
+        closing = controller.wait_for(lambda row: row["type"] == "lsm_stopped")
+        assert not closing["ok"] and controller.process.wait(timeout=10) == 1, closing
+        readable(files[0])
+        print("PASS: VM-file socket registration, exact read/write denial, pre-existing descriptor boundary, missing-entry detection and independent ownership", flush=True)
+    finally:
+        if controller:
+            controller.release()
+        current = parent.stat()
+        if (current.st_dev, current.st_ino) != (owner.st_dev, owner.st_ino):
+            raise RuntimeError("Local test socket directory ownership changed; refusing cleanup")
+        shutil.rmtree(parent)
 
 
 def socket_checks(mode, files, loop_device=None):
@@ -447,6 +516,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     modes = parser.add_mutually_exclusive_group(required=True)
     modes.add_argument("--loopback", action="store_true")
+    modes.add_argument("--local", action="store_true", help="Use disposable files on the VM's internal filesystem")
     modes.add_argument("--usb", type=Path, metavar="MOUNT_DIRECTORY")
     args = parser.parse_args()
     if sys.platform != "linux" or os.geteuid() != 0:
@@ -454,7 +524,19 @@ def main():
     if not BINARY.is_file():
         parser.error("Build the controller first")
     subprocess.run([str(BINARY), "--check"], check=True)
-    if args.usb:
+    if args.local:
+        base = (REPO / "build/test-tmp").resolve()
+        base.mkdir(parents=True, exist_ok=True)
+        temporary = Path(tempfile.mkdtemp(prefix="lsm-local-", dir=base)).resolve()
+        owner = temporary.stat()
+        try:
+            run_checks("--local-files", temporary)
+        finally:
+            current = temporary.stat()
+            if temporary.parent != base or (current.st_dev, current.st_ino) != (owner.st_dev, owner.st_ino):
+                raise RuntimeError("Local fixture ownership changed; refusing cleanup")
+            shutil.rmtree(temporary)
+    elif args.usb:
         directory = usb_directory(args.usb)
         # Only this newly owned fixture directory is created/deleted on the drive.
         temporary = Path(tempfile.mkdtemp(prefix="portwatchman-lsm-", dir=directory))

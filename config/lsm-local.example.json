@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "socket_path": "/run/portwatchman/lsm_controller.sock",
+  "protected_paths": [
+    "/var/tmp/portwatchman-vm-demo/restricted.txt"
+  ]
+}

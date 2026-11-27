@@ -4,7 +4,7 @@ PortWatchman controls newly connected USB devices on Linux. It keeps devices on
 selected USB buses blocked until their reported identity matches an allowlist.
 An unapproved device remains blocked and can trigger a configured response, such
 as locking the session. Optional BPF-LSM protection denies new opens of selected
-files on an approved USB drive.
+files on the VM's internal filesystem, independently of USB connections.
 
 This guide is for users operating the tool in an Ubuntu virtual machine or
 reviewing its behaviour for a demonstration. PortWatchman is an academic prototype;
@@ -18,7 +18,7 @@ the [limitations](#limitations) describe the boundaries of its protection.
 - [Run from the terminal](#run-from-the-terminal)
 - [Install and operate the background service](#install-and-operate-the-background-service)
 - [Manage the allowlist and enrol a new USB](#manage-the-allowlist-and-enrol-a-new-usb)
-- [Optional protection for selected USB files](#optional-protection-for-selected-usb-files)
+- [Protect selected files inside the VM](#protect-selected-files-inside-the-vm)
 - [Configure response actions](#configure-response-actions)
 - [Understand status and logs](#understand-status-and-logs)
 - [Troubleshooting and recovery](#troubleshooting-and-recovery)
@@ -30,7 +30,11 @@ the [limitations](#limitations) describe the boundaries of its protection.
 ```mermaid
 flowchart TD
     Start["Start PortWatchman"] --> Check["Check configuration and prerequisites"]
-    Check --> Default["Set default-deny on selected USB buses"]
+    Check --> Local{"VM-file protection configured?"}
+    Local -->|Yes| Protect["Register selected internal files with BPF-LSM"]
+    Protect --> Verify["Confirm every required file is protected"]
+    Verify --> Default["Set default-deny on selected USB buses"]
+    Local -->|No| Default
     Default --> Ready["Pipeline ready: wait for a new USB connection"]
     Ready --> USB["USB connects and starts blocked"]
     USB --> Monitor["eBPF detects USB setup"]
@@ -40,10 +44,7 @@ flowchart TD
     Policy -->|Yes| Revalidate{"Identity still valid and allowed?"}
     Revalidate -->|Yes| Allow["Authorise the device"]
     Revalidate -->|No| Refuse["Refuse authorisation and report the outcome"]
-    Allow --> LSM{"File protection configured for this rule?"}
-    LSM -->|Yes| Register["After mounting, register selected files with BPF-LSM"]
-    LSM -->|No| Log["Log outcomes and continue monitoring"]
-    Register --> Log
+    Allow --> Log["Log outcomes and continue monitoring"]
     Refuse --> Log
 
     Policy -->|No| Block["Keep the device blocked"]
@@ -55,7 +56,8 @@ flowchart TD
     Log --> Ready
 ```
 
-Selected-file protection begins only after successful registration. Component or
+Configured VM-file protection must be registered successfully before service readiness.
+It remains active across USB connections and disconnections. Component or
 registration failures follow the recovery behaviour described below: the service
 reports failure, stops its components and retains deny state for explicit recovery.
 
@@ -65,7 +67,7 @@ reports failure, stops its components and retains deny state for explicit recove
 | The pipeline becomes ready | Reports `service_ready` and healthy status; the installed systemd unit reports running |
 | A new USB connects | Reads its reported vendor ID, product ID and optional serial/port constraint |
 | The device matches the allowlist | Revalidates its identity and authorises the device |
-| An approved storage device mounts | Registers configured files with the optional BPF-LSM controller |
+| VM-file protection is enabled | Registers the configured internal files before USB arming/readiness and checks their registrations approximately every second |
 | The device does not match | Keeps it blocked and sends the result to the response component |
 | A normal stop is requested | Releases file restrictions, stops components and restores the recorded original bus defaults |
 | A component fails unexpectedly | Reports failure, stops the remaining components and retains default-deny for explicit recovery |
@@ -73,10 +75,11 @@ reports failure, stops its components and retains deny state for explicit recove
 **Response preview does not disable USB enforcement.** A normal service run changes
 USB authorisation even with `apply_responses: false`. That setting previews only
 the response plan: for example, it reports a planned lock without locking the screen.
+Configured VM-file restrictions also remain live when responses are in preview.
 
 Use the service with the test USB **disconnected until readiness**. Devices already
 connected retain their existing access and are not automatically re-evaluated or
-enrolled in file protection at startup. When using VMware, connect the USB to the
+enrolled in the legacy USB-file bridge at startup. Configured VM files are protected at startup regardless of connected devices. When using VMware, connect the USB to the
 Ubuntu guest through VMware's USB/removable-device controls. Guest enforcement
 does not protect the Windows host.
 
@@ -92,7 +95,7 @@ does not protect the Windows host.
 | Python | Python 3.10 or later; application Python components use the standard library |
 | Monitor | bpftrace; the recorded environment used `0.20.2` |
 | Permissions | `sudo`/root for live monitoring, enforcement, service operation and controller access |
-| USB storage | An intended test drive; optional file protection requires a mounted filesystem and existing regular files |
+| Test files | Existing regular files on the VM disk for VM-file protection; a mounted USB filesystem only for legacy USB-file mode |
 
 The application runs inside Linux. You may edit and push code on Windows, then
 pull it into Ubuntu, but do not run the Linux enforcement commands on Windows.
@@ -174,7 +177,8 @@ The service profile selects these configuration files:
 | `policy` | Allowlist JSON file |
 | `enforcement` | Managed buses and saved-state location |
 | `responses` | Response plan JSON file |
-| `lsm` | Bridge JSON file, or `null` to disable selected-file protection |
+| `local_lsm` | JSON file listing absolute VM file paths; `null` disables VM-file protection |
+| `lsm` | Legacy USB-file bridge JSON file; keep `null` when using `local_lsm` |
 | `apply_responses` | Boolean; `false` previews responses, `true` executes the plan |
 | `startup_timeout` | Readiness timeout in seconds; default 90, allowed 1–120 |
 | `shutdown_timeout` | Pipeline drain timeout in seconds; default 30, allowed 1–60 |
@@ -446,8 +450,10 @@ sudo systemctl disable --now portwatchman
 ```
 
 Boot startup does not guarantee protection before readiness or automatically
-process devices already present. Bus numbering can change. File protection still
-needs the approved USB filesystem to be mounted; unattended mounting is not provided.
+process devices already present. Bus numbering can change. VM files must already
+exist and their internal filesystem must be mounted at service startup. Only the
+legacy USB-file mode waits for an approved USB mount; unattended USB mounting is
+not provided.
 
 ## Manage the allowlist and enrol a new USB
 
@@ -512,7 +518,8 @@ names are rejected. Also confirm the new device's bus is in the installed
 After successful validation, disconnect the blocked drive, start the service, wait
 for readiness and reconnect. The new connection is evaluated using the rule.
 Changing a rule does not automatically re-evaluate a connection already processed.
-An LSM rule is optional for each allowed device; add one separately if needed.
+VM-file protection does not need an allowlist mapping. Only legacy USB-file mode
+uses optional file-protection mappings for allowed devices.
 
 To remove a rule while stopped:
 
@@ -522,7 +529,7 @@ sudo python3 /opt/portwatchman/src/policy/device_policy.py \
   --name additional-trusted-usb
 ```
 
-Keep LSM mappings consistent: every configured `allowlist_rule` must still name
+For legacy USB-file mode, keep mappings consistent: every `allowlist_rule` must name
 an existing policy rule. Update the bridge configuration or disable its `lsm`
 setting before removing its last mapping. Validate the complete service profile.
 Removing a rule alone does not revoke an already-authorised device.
@@ -542,163 +549,157 @@ sudo python3 /opt/portwatchman/src/enforcement/usb_authorization.py \
   --policy /etc/portwatchman/allowlist.json authorize "$USB_ID" --apply
 ```
 
-This authorises according to policy but does not register LSM protection. Use a new
-connection through the running service when selected-file protection is required.
+This authorises according to policy. VM-file protection is managed separately by
+the service and does not depend on this command or a new USB connection.
 
-## Optional protection for selected USB files
+## Protect selected files inside the VM
 
-This feature blocks **new data opens of configured file identities**. It does not
-make the entire drive inaccessible. The drive may be authorised and mounted while
-one selected file returns `Permission denied` and a control file remains readable.
+The BPF-LSM guard blocks **new data opens of explicitly selected regular files on
+the VM's internal filesystem**. Protection starts before service readiness and
+does not depend on a USB being connected, authorised, mounted or disconnected.
+USB allow/block decisions continue separately.
+
+The same denial applies to ordinary applications and root processes. This is not
+a trusted-application policy, malware detector, general copying firewall or memory
+dump prevention mechanism. Use disposable demonstration files first. Do not select
+the interpreter, service code/configuration, system programs or files needed to
+operate the VM. Files selected for deletion/sanitisation must be separate from the
+protected files: configured overlaps are rejected, and the guard is never bypassed.
 
 ### Build the controller
 
-With the service stopped, run in the Ubuntu clone:
+With PortWatchman stopped, run in the Ubuntu clone:
 
 ```bash
 bash src/enforcement/bpf/build.sh
 sudo src/enforcement/bpf/build/lsm_controller --check
 ```
 
-Expect `lsm_preflight_passed`. A successful build does not start persistent
-enforcement. The service will start its own controller; do not start another one.
+### Create disposable VM files and a local profile
 
-### Create a disposable example and mapping
-
-Use the matching drive while it is authorised and mounted. Confirm `USB_MOUNT`
-with `findmnt`; replace the placeholder before running:
+The following uses the manual's previously prepared `logs/manual-service.json`
+profile. It creates files inside the checkout on the VM disk, not on the USB.
+For another profile, change `service_path` to that already validated profile.
 
 ```bash
-export USB_MOUNT='/path/to/mounted/usb'
-findmnt -T "$USB_MOUNT" -o SOURCE,TARGET,FSTYPE
-
 python3 - <<'PY'
 import json
-import os
 from pathlib import Path
 import tempfile
 
-mount = Path(os.environ["USB_MOUNT"])
-if not mount.is_mount():
-    raise SystemExit("Expected the actual USB mount directory.")
 service_path = Path("logs/manual-service.json")
 service = json.loads(service_path.read_text())
-policy = json.loads(Path(service["policy"]).read_text())
-if not any(rule["name"] == "trusted-usb" for rule in policy["allowlist"]):
-    raise SystemExit("Expected the trusted-usb rule from the local manual profile.")
-lsm_path = Path("logs/manual-lsm.json")
-if lsm_path.exists() or service.get("lsm") is not None:
+if service.get("lsm") is not None or service.get("local_lsm") is not None:
     raise SystemExit("Existing file-protection configuration found; edit it explicitly.")
-
-fixture = Path(tempfile.mkdtemp(prefix="portwatchman-demo-", dir=mount))
-(fixture / "restricted.txt").write_text("Restricted demonstration file\n")
-(fixture / "control.txt").write_text("Readable control file\n")
-bridge = {
-    "schema_version": 1,
-    "socket_path": "/run/portwatchman/lsm_controller.sock",
-    "registration_timeout_seconds": 30,
-    "on_error": "report",
-    "rules": [{
-        "allowlist_rule": "trusted-usb",
-        "protected_paths": [f"{fixture.name}/restricted.txt"],
-    }],
-}
-lsm_path.write_text(json.dumps(bridge, indent=2) + "\n")
-service["lsm"] = str(lsm_path)
+base = Path("build/test-tmp").resolve()
+base.mkdir(parents=True, exist_ok=True)
+fixture = Path(tempfile.mkdtemp(prefix="portwatchman-vm-", dir=base))
+(fixture / "restricted.txt").write_text("Protected VM file\n")
+(fixture / "control.txt").write_text("Readable VM control\n")
+local_path = Path("logs/manual-lsm-local.json")
+with local_path.open("x") as output:
+    json.dump({
+        "schema_version": 1,
+        "socket_path": "/run/portwatchman/lsm_controller.sock",
+        "protected_paths": [str(fixture / "restricted.txt")],
+    }, output, indent=2)
+    output.write("\n")
+service["lsm"] = None
+service["local_lsm"] = str(local_path)
 service_path.write_text(json.dumps(service, indent=2) + "\n")
-print("Fixture:", fixture)
-print("Restricted:", fixture / "restricted.txt")
-print("Control:", fixture / "control.txt")
+print("Restricted VM file:", fixture / "restricted.txt")
+print("Readable control:", fixture / "control.txt")
 PY
 
 python3 src/daemon/portwatchman.py --config logs/manual-service.json validate
 sudo python3 src/daemon/portwatchman.py --config logs/manual-service.json check
 ```
 
-`protected_paths` are relative to the USB filesystem root, not `/media/...` paths.
-Each must identify an existing regular file; symlink paths and `..` are refused.
-The `allowlist_rule` name must match the policy rule exactly. Multiple files can
-be listed; the current bridge configuration allows at most 128 protected paths.
+The example format is also in `config/lsm-local.example.json`; its example target
+must exist before it can pass live preflight. Paths must be canonical absolute
+Linux paths to existing individual files. Directories, symlink components,
+traversal, USB-backed filesystems, loop devices and pseudo filesystems are refused.
+At most 128 distinct file identities can be registered. Internal block devices,
+including the guest root filesystem and verified non-USB stacked devices, are
+eligible. No protected files are created automatically by the running service.
 
-`on_error: report` reports incomplete protection without deliberately deauthorising
-the device; the supervisor treats the error as a service failure and cleans up.
-The alternative `deauthorize` attempts to revoke device access on bridge error and
-can interrupt USB I/O. Neither option eliminates the interval between authorisation,
-mounting and registration, or guarantees protection after controller exit.
+### Start and inspect
 
-For a first installation, install this updated local profile using the installer.
-For an installation originally created from this manual's matching profile, stop
-the service, copy the new bridge config, and edit the installed service profile:
+Start with the test USB disconnected, as for ordinary USB enforcement:
+
+```bash
+sudo python3 src/daemon/portwatchman.py --config logs/manual-service.json run
+```
+
+In a second terminal:
+
+```bash
+sudo python3 src/daemon/portwatchman.py status
+sudo python3 src/enforcement/lsm_client.py STATUS
+cat '/absolute/path/printed/above/restricted.txt'
+cat '/absolute/path/printed/above/control.txt'
+```
+
+Replace the example paths with the actual paths printed during preparation.
+Expect `lsm_scope: "vm-files"`, controller `mode: "local-files"`, a startup
+`lsm_local_registered` event with `protection_complete: true`, and the correct
+targets. The restricted file must return `Permission denied` even before USB
+insertion; the control must remain readable. A denied open increases
+`denied_opens`. `enforcement_active: true` alone does not prove any file is enrolled.
+Local target `usb_id` is `null`; its protocol `connection_id` is a `local:` service
+ownership identifier, not a USB connection.
+
+Connect the approved drive, check authorisation, then unmount and disconnect it
+normally. Repeat both VM file reads: the same VM files must remain protected.
+An unapproved USB should still remain blocked and trigger the configured response
+or preview. VM-file denial itself does not trigger a response action.
+
+Stop the foreground service with Ctrl+C. After normal shutdown, the restricted
+file should be readable again and the original USB bus defaults restored. Loss of
+a required registration or controller causes a service failure, not a successful
+ready state or silent re-registration. As before, controller exit detaches the
+guard; VM protection does not survive a stopped or failed controller.
+
+### Update an existing installed service
+
+Checkout changes do not update `/opt/portwatchman` or `/etc/portwatchman` by themselves.
+Stop the installed service, rebuild the native controller, and update installed
+code using the installer. Installed configuration is preserved:
 
 ```bash
 sudo systemctl stop portwatchman
-sudo install -o root -g root -m 600 logs/manual-lsm.json /etc/portwatchman/lsm.json
+bash src/enforcement/bpf/build.sh
+sudo python3 scripts/install_service.py --update-code
+sudo install -o root -g root -m 600 logs/manual-lsm-local.json /etc/portwatchman/lsm-local.json
 sudoedit /etc/portwatchman/service.json
 ```
 
-Set `"lsm": "/etc/portwatchman/lsm.json"`. Ensure its rule name exists in the
-installed policy. Copy the freshly built controller and check the installed profile:
+Set `"local_lsm": "/etc/portwatchman/lsm-local.json"` and `"lsm": null` in the
+installed service profile. Keep the policy, bus and response settings appropriate
+for your environment. The protected VM paths remain absolute paths to the files
+you selected; the installer does not relocate those files.
 
 ```bash
-sudo python3 scripts/install_service.py --update-code
-sudo python3 /opt/portwatchman/src/daemon/portwatchman.py \
-  --config /etc/portwatchman/service.json validate
-sudo python3 /opt/portwatchman/src/daemon/portwatchman.py \
-  --config /etc/portwatchman/service.json check
-```
-
-Changing the checkout's service JSON alone does not update the installation.
-
-Unmount and disconnect the drive, start the service, wait for readiness, then
-reconnect. Mounting must occur within the configured registration timeout; use
-desktop automount or mount the currently verified partition yourself.
-
-### Inspect protection
-
-For the installed service:
-
-```bash
+sudo python3 /opt/portwatchman/src/daemon/portwatchman.py --config /etc/portwatchman/service.json validate
+sudo python3 /opt/portwatchman/src/daemon/portwatchman.py --config /etc/portwatchman/service.json check
+sudo systemctl start portwatchman
+sudo python3 /opt/portwatchman/src/daemon/portwatchman.py status
 sudo python3 /opt/portwatchman/src/enforcement/lsm_client.py STATUS
 ```
 
-Wait for `lsm_bridge_registered` with `protection_complete: true`, and confirm the
-expected file appears in `targets`. Copy its actual paths into the following:
+Use `systemctl stop portwatchman` to release installed-service protection normally.
+Do not stop its controller separately or use `PREPARE_REMOVE`: that command is for
+the legacy USB-file mode and is rejected in VM-file mode.
 
-```bash
-cat '/path/to/mounted/usb/REPLACE_WITH_FIXTURE/restricted.txt'
-cat '/path/to/mounted/usb/REPLACE_WITH_FIXTURE/control.txt'
-sudo python3 /opt/portwatchman/src/enforcement/lsm_client.py STATUS
-```
+### Existing USB-file mode
 
-Expect the restricted file to be denied, the control readable, and `denied_opens`
-to increase. `enforcement_active: true` only means the controller is attached;
-an empty `targets` list means no selected files are registered.
-
-### Remove the USB while keeping the service running
-
-Protected file references can keep the mount busy. Read the current controller
-status and use the **full current connection_id**, not the USB ID or target ID:
-
-```bash
-CONNECTION_ID='REPLACE_WITH_FULL_CURRENT_CONNECTION_ID'
-sudo python3 /opt/portwatchman/src/enforcement/lsm_client.py \
-  PREPARE_REMOVE "$CONNECTION_ID"
-```
-
-Expect `lsm_connection_prepared`, then `lsm_bridge_prepared_for_removal` in the
-service journal. Confirm no active targets remain for that connection. Protection
-has deliberately ended for that connection; now unmount the verified partition:
-
-```bash
-udisksctl unmount -b "$USB_PARTITION"
-```
-
-Disconnect only after unmount succeeds. Reconnection is a new generation and should
-receive a new `connection_id` and registration. `prepared_connections` contains
-bounded recent removal markers; those are not active protected targets. If you do
-not need continued monitoring, stopping the whole service normally before unmounting
-is the simpler alternative. Do not send the controller `STOP` while its owning
-service is running; use `systemctl stop portwatchman` for normal shutdown.
+Older profiles using `lsm` and `config/lsm-bridge.example.json` continue to restrict
+selected files on an approved USB after mounting. That is a separate mode, with
+USB connection ownership and `PREPARE_REMOVE` before unmounting a protected drive.
+It is not VM-file protection. A service profile must choose either `local_lsm` or
+legacy `lsm`; both cannot be enabled together. See
+[the legacy bridge guide](docs/STEP6-TESTING.md) for that mode, and
+[VM-file verification](docs/VM-FILE-PROTECTION-TESTING.md) for the current VM use.
 
 ## Configure response actions
 
@@ -796,7 +797,8 @@ check connection/target identity before interpreting that as two operations.
 | `enforcement_result`, `action: allow` | Device decision/action; verify authorisation and the block device when checking actual access |
 | `action: block`, `reason: already_blocked` | Device was already unauthorised; `enforcement_applied: false` here does not mean it was allowed |
 | Device `kernel_authorized: false` inside an allow result | The identity snapshot may have been captured before authorisation; read current sysfs state to confirm |
-| `lsm_bridge_pending` | Waiting for the mounted filesystem and configured files |
+| `lsm_local_registered` | Configured VM files registered before service readiness |
+| `lsm_bridge_pending` | Legacy USB-file mode: waiting for the mounted filesystem and files |
 | `lsm_bridge_registered`, `protection_complete: true` | Files registered with the current controller |
 | `response_action`, `applied: false` | Response preview |
 | `response_action`, `applied: true`, `ok: true` | Action reported success; a power-command result is not proof of total shutdown latency |
@@ -823,9 +825,10 @@ authorised. These are Linux USB authorisation attributes, described in the
 |---|---|
 | `Device or required attributes unavailable` | Run `list` again; the selected USB ID may be wrong, disconnected or now assigned to another device |
 | Drive is absent from `lsblk` | Check whether it is intentionally blocked and whether its inspected identity matches the selected policy |
-| Drive is allowed but file protection is pending | Check the current mount, existing relative paths and rule name; mount before the registration timeout |
+| Legacy USB-file protection is pending | Check the current mount, existing relative paths and rule name; mount before the registration timeout |
+| VM-file preflight or registration fails | Check the absolute file paths, non-USB block-backed filesystem, absence of symlinks, rebuilt controller and separate cleanup targets |
 | Selected file remains readable | Confirm registration and active target identity; replacement files and pre-existing data descriptors are outside the guard's scope |
-| Unmount says `target is busy` | Use PREPARE_REMOVE for the current protected connection or stop the owning service; close other applications using the mount |
+| Unmount says `target is busy` | For legacy USB-file mode, prepare that USB connection for removal; for VM-file mode, USB removal needs no LSM command. Close other applications using the mount |
 | No screen lock | Confirm `apply_responses`, the lock action, the blocked result, cooldown and an available lockable session |
 | Ownership-lock error | An existing service/check/install/restore operation owns the runtime lock; inspect it rather than deleting the lock file |
 | Existing arm state or LSM socket refused | Identify and stop its owner, inspect logs, and restore with the exact original configuration |
@@ -921,8 +924,10 @@ an update. Change installed settings explicitly while stopped and validate them.
   general composite-device/HID firewall in this application.
 - File protection follows registered regular-file identities through rename/hardlinks,
   but does not automatically enrol replacement files. It does not cover pre-existing
-  data descriptors, mmap, raw-device access or whole volumes. Authorisation/mounting
-  occurs before registration, and controller exit removes its restrictions.
+  data descriptors, mmap, raw-device access or whole volumes. VM files are enrolled
+  before service readiness; legacy USB-file mode registers after authorisation/
+  mounting. Controller exit removes either mode's restrictions. No application
+  exemption or general memory-dump prevention is provided.
 - The service does not mount filesystems. The verified boot use involves a desktop
   session and a drive connected after readiness; unattended mounting is not provided.
 - Responses run synchronously. A long action can delay reading later events beyond

@@ -78,7 +78,8 @@ def run(config, emit):
         host = Host(config, emit)
         identity = {"pid": os.getpid(), "boot_id": boot_id(),
                     "process_start_ticks": process_identity(os.getpid()),
-                    "apply_responses": config.apply_responses, "lsm_enabled": config.lsm is not None,
+                    "apply_responses": config.apply_responses, "lsm_enabled": config.lsm_enabled,
+                    "lsm_scope": config.lsm_scope,
                     "scope": "new USB connections", "policy": str(config.policy),
                     "enforcement": str(config.enforcement)}
         supervisor = None
@@ -126,7 +127,8 @@ def main(argv=None):
         if args.command == "validate":
             _policy, _enforcement, response, bridge = components(config)
             emit({"type": "service_config", "valid": True, "commands": commands(config),
-                  "apply_responses": config.apply_responses, "lsm_enabled": bridge is not None,
+                  "apply_responses": config.apply_responses, "lsm_enabled": config.lsm_enabled,
+                  "lsm_scope": config.lsm_scope,
                   "response_plan": response.actions, "scope": "new USB connections"})
             return 0
         if args.command == "check":

@@ -13,8 +13,24 @@ See the "USB access control" section of the top-level README and
 `bpf/lsm_guard.bpf.c` restricts new opens of selected file identities.
 `bpf/lsm_controller.c` loads/attaches it and exposes ADD/REMOVE/LIST/STATUS/STOP over
 a root-only Unix socket (`bpf/lsm_socket.c`); target resolution and lifetime checks
-are in `bpf/lsm_targets.c`. USB mode verifies physical
-USB ancestry; `--test-loopback` is an explicit isolated test mode. Nothing is pinned.
+are in `bpf/lsm_targets.c`. `--local-files` supports selected regular files on
+non-USB block-backed VM filesystems, including the guest root filesystem. USB mode
+still verifies physical USB ancestry; `--test-loopback` remains an explicit isolated
+test mode. Nothing is pinned.
+
+The integrated service uses `local_lsm` with `lsm_local.py` to register absolute VM
+file paths before USB arming and readiness, then verifies them independently of USB
+events. Missing entries or a changed/degraded controller fail the service. A normal
+service stop detaches the controller and releases the restrictions. No USB event
+releases VM files, and PREPARE_REMOVE is refused by the local-files controller.
+Configuration is in `config/lsm-local.example.json`; see
+[VM-file verification](../../docs/VM-FILE-PROTECTION-TESTING.md).
+
+VM-file protection denies new data opens by all processes, including root. It
+does not revoke existing data descriptors, protect replacement inodes automatically,
+or prevent memory dumping. Delete/sanitise targets must be separate: the service
+rejects declared overlaps rather than bypassing the guard. Select either `local_lsm`
+or legacy `lsm`, not both. Neither mode is enabled by the default profile.
 
 Build with `bash src/enforcement/bpf/build.sh` from the repository root. See
 [docs/STEP6-TESTING.md](../../docs/STEP6-TESTING.md) for requirements, exact protection

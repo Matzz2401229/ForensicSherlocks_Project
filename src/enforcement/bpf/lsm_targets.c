@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "lsm_targets.h"
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,8 +64,85 @@ void pw_target_close(struct pw_target *target)
     target->used = target->mapped = false;
 }
 
-int pw_target_open(const char *path, bool loop, struct pw_target *out, char error[256])
+/* Inspect block ancestry and stacked-device slaves. Unknown backing fails closed;
+ * local mode never silently becomes a way to enrol USB or loopback targets. */
+static bool local_backing(const char *node, unsigned depth)
 {
+    char ancestor[PATH_MAX], probe[PATH_MAX], resolved[PATH_MAX];
+    if (depth > 8 || strlen(node) >= sizeof(ancestor))
+        return false;
+    const char *name = strrchr(node, '/');
+    if (name && !strncmp(name + 1, "loop", 4))
+        return false;
+    snprintf(ancestor, sizeof(ancestor), "%s", node);
+    for (;;) {
+        if (snprintf(probe, sizeof(probe), "%s/subsystem", ancestor) >= (int)sizeof(probe))
+            return false;
+        if (realpath(probe, resolved) && !strcmp(resolved, "/sys/bus/usb"))
+            return false;
+        char *slash = strrchr(ancestor, '/');
+        if (!slash || slash == ancestor)
+            break;
+        *slash = '\0';
+    }
+    if (snprintf(probe, sizeof(probe), "%s/slaves", node) >= (int)sizeof(probe))
+        return false;
+    DIR *slaves = opendir(probe);
+    if (!slaves)
+        return errno == ENOENT; /* Partitions have no slaves directory. */
+    bool valid = true;
+    struct dirent *entry;
+    errno = 0;
+    while ((entry = readdir(slaves))) {
+        if (entry->d_name[0] == '.')
+            continue;
+        if (snprintf(probe, sizeof(probe), "%s/slaves/%s", node, entry->d_name) >= (int)sizeof(probe) ||
+            !realpath(probe, resolved) || !local_backing(resolved, depth + 1)) {
+            valid = false;
+            break;
+        }
+        errno = 0;
+    }
+    if (!entry && errno)
+        valid = false;
+    closedir(slaves);
+    return valid;
+}
+
+/* Resolve each local component through held directory descriptors. Parent
+ * symlinks and traversal are rejected as well as a final symlink. */
+static int open_local(const char *path)
+{
+    if (path[0] != '/' || path[1] == '/' || path[strlen(path) - 1] == '/') {
+        errno = EINVAL;
+        return -1;
+    }
+    char parts[PATH_MAX];
+    snprintf(parts, sizeof(parts), "%s", path + 1);
+    int fd = open("/", O_PATH | O_DIRECTORY | O_CLOEXEC);
+    char *part = parts;
+    while (fd >= 0 && part && *part) {
+        char *next = strchr(part, '/');
+        if (next)
+            *next++ = '\0';
+        if (!*part || !strcmp(part, ".") || !strcmp(part, "..")) {
+            close(fd);
+            errno = EINVAL;
+            return -1;
+        }
+        int child = openat(fd, part, O_PATH | O_NOFOLLOW | O_CLOEXEC | (next ? O_DIRECTORY : 0));
+        int saved = errno;
+        close(fd);
+        fd = child;
+        errno = saved;
+        part = next;
+    }
+    return fd;
+}
+
+int pw_target_open(const char *path, enum pw_target_mode mode, struct pw_target *out, char error[256])
+{
+    bool loop = mode == PW_LOOPBACK, local = mode == PW_LOCAL;
     struct stat file_stat, after, root_stat;
     struct statx extended;
     char block[128], resolved[PATH_MAX], probe[PATH_MAX], subsystem[PATH_MAX];
@@ -77,7 +155,7 @@ int pw_target_open(const char *path, bool loop, struct pw_target *out, char erro
     }
     /* O_PATH keeps this inode/mount alive without opening it for data access.
      * A final symlink is rejected; parent aliases resolve to the opened object. */
-    out->fd = open(path, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    out->fd = local ? open_local(path) : open(path, O_PATH | O_NOFOLLOW | O_CLOEXEC);
     if (out->fd < 0 || fstat(out->fd, &file_stat))
         goto system_error;
     if (!S_ISREG(file_stat.st_mode) || file_stat.st_nlink == 0) {
@@ -86,7 +164,7 @@ int pw_target_open(const char *path, bool loop, struct pw_target *out, char erro
     }
     if (stat("/", &root_stat))
         goto system_error;
-    if (file_stat.st_dev == root_stat.st_dev) {
+    if (!local && file_stat.st_dev == root_stat.st_dev) {
         snprintf(error, 256, "Refusing a target on the guest root filesystem");
         goto invalid;
     }
@@ -102,7 +180,13 @@ int pw_target_open(const char *path, bool loop, struct pw_target *out, char erro
     snprintf(block, sizeof(block), "/sys/dev/block/%u:%u", out->key.major, out->key.minor);
     if (!realpath(block, resolved))
         goto system_error;
-    if (loop) {
+    if (local) {
+        if (!local_backing(resolved, 0)) {
+            snprintf(error, 256, "Local mode requires an internal block-backed filesystem, excluding USB and loop devices");
+            goto invalid;
+        }
+        snprintf(out->node, sizeof(out->node), "%s", resolved);
+    } else if (loop) {
         const char *name = strrchr(resolved, '/');
         const char *digit = name ? name + 1 : resolved;
         if (strncmp(digit, "loop", 4)) {
@@ -147,7 +231,7 @@ int pw_target_open(const char *path, bool loop, struct pw_target *out, char erro
         snprintf(error, 256, "Device changed during validation");
         goto invalid;
     }
-    if (!loop) {
+    if (!loop && !local) {
         int address = usb_address(out->node_fd);
         if (address < 0) {
             snprintf(error, 256, "Cannot establish USB device address");

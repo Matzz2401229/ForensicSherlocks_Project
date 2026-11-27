@@ -25,6 +25,7 @@ FILES = (
     "src/daemon/portwatchman.py", "src/daemon/service_config.py", "src/daemon/service_runtime.py",
     "src/monitor/usb_monitor.py", "src/monitor/usb_events.bt", "src/policy/device_policy.py",
     "src/enforcement/usb_authorization.py", "src/enforcement/lsm_client.py", "src/enforcement/lsm_bridge.py",
+    "src/enforcement/lsm_local.py",
     "src/responses/responses.py", "src/responses/response_delete.py",
 )
 CONTROLLER = "src/enforcement/bpf/build/lsm_controller"
@@ -77,12 +78,15 @@ def payloads(config):
     installed = {"schema_version": 1, "policy": str(ETC / "allowlist.json"),
                  "enforcement": str(ETC / "enforcement.json"), "responses": str(ETC / "responses.json"),
                  "lsm": str(ETC / "lsm.json") if config.lsm else None,
+                 "local_lsm": str(ETC / "lsm-local.json") if config.local_lsm else None,
                  "apply_responses": config.apply_responses, "startup_timeout": config.startup_timeout,
                  "shutdown_timeout": config.shutdown_timeout, "command_timeout": config.command_timeout}
     result = {"allowlist.json": config.policy.read_bytes(), "enforcement.json": encoded(enf),
               "responses.json": config.responses.read_bytes(), "service.json": encoded(installed)}
     if config.lsm:
         result["lsm.json"] = config.lsm.read_bytes()
+    if config.local_lsm:
+        result["lsm-local.json"] = config.local_lsm.read_bytes()
     return result
 
 
@@ -129,7 +133,7 @@ def install(config_path, update=False):
         binary = ROOT / CONTROLLER
         if binary.exists():
             files.append(CONTROLLER)
-        elif config.lsm:
+        elif config.lsm_enabled:
             raise ServiceError("Build the native BPF-LSM controller before installing an LSM-enabled profile")
         hashes = {}
         for name in files:

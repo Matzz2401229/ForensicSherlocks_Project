@@ -1,5 +1,6 @@
 """Service config/supervision tests: fake children; Linux locks use owned fixtures."""
 import contextlib
+from dataclasses import replace
 import importlib.util
 import io
 import json
@@ -70,6 +71,28 @@ class ConfigTests(Fixture):
         self.assertIn("--lsm-config", commands(config)["enforcement"])
         self.assertNotIn("--lsm-config", commands(self.config)["enforcement"])
 
+    def test_vm_guard_is_opt_in_and_not_a_usb_bridge(self):
+        config = load_config(self.document(local_lsm="logs/vm-files.json"))
+        self.assertTrue(config.lsm_enabled)
+        self.assertEqual(config.lsm_scope, "vm-files")
+        self.assertNotIn("--lsm-config", commands(config)["enforcement"])
+        self.assertEqual(config.local_lsm, ROOT / "logs/vm-files.json")
+
+    def test_vm_and_usb_modes_cannot_be_combined(self):
+        with self.assertRaises(ServiceError):
+            load_config(self.document(local_lsm="logs/vm-files.json", lsm="logs/usb-files.json"))
+
+    def test_empty_vm_config_path_is_rejected(self):
+        with self.assertRaises(ServiceError):
+            load_config(self.document(local_lsm=""))
+
+    def test_local_controller_command_does_not_use_usb_mode(self):
+        host = object.__new__(Host)
+        host.local_guard = SimpleNamespace(config=SimpleNamespace(socket_path="/run/portwatchman/lsm_controller.sock"))
+        command = host.controller_command()
+        self.assertIn("--local-files", command)
+        self.assertNotIn("--usb", command)
+
     def test_rejects_bad_types_and_unknown_fields(self):
         for fields in ({"schema_version": True}, {"apply_responses": "yes"}, {"policy": []},
                        {"unknown": 1}, {"startup_timeout": False}, {"shutdown_timeout": 0},
@@ -124,6 +147,22 @@ class HealthTests(unittest.TestCase):
         self.assertFalse(health.ready())
         health.observe("enforcement", event("lsm_bridge_started"))
         self.assertTrue(health.ready())
+
+    def test_vm_guard_requires_local_registration_not_usb_bridge(self):
+        health = Health(lsm=True, local_files=True)
+        self.populate(health)
+        health.observe("lsm", event("lsm_ready", mode="local-files"))
+        health.observe("enforcement", event("lsm_bridge_started"))
+        self.assertFalse(health.ready())
+        health.observe("local", event("lsm_local_registered", protection_complete=False))
+        self.assertFalse(health.ready())
+        health.observe("local", event("lsm_local_registered", protection_complete=True))
+        self.assertTrue(health.ready())
+
+    def test_vm_guard_rejects_usb_controller_mode(self):
+        health = Health(lsm=True, local_files=True)
+        health.observe("lsm", event("lsm_ready", mode="usb"))
+        self.assertIsNotNone(health.failure())
 
     def test_starting_status_and_already_blocked_are_not_failures(self):
         health = Health()
@@ -196,6 +235,15 @@ class FakeHost:
         return {"applied": True}
     def controller_command(self):
         return ["fake-controller"]
+    def register_local(self, deadline):
+        self.calls.append("register_local")
+        if self.fail_at == "register_local":
+            raise ServiceError("injected local registration failure")
+        return event("lsm_local_registered", protection_complete=True)
+    def check_local(self, *, force=False):
+        self.calls.append("check_local")
+        if self.fail_at == "check_local":
+            raise ServiceError("injected local guard loss")
     def signal(self, process, sig):
         self.calls.append((process.stage, sig))
         if process.stage == "monitor":
@@ -224,7 +272,9 @@ class Harness(Supervisor):
 
 
 class SupervisionTests(Fixture):
-    def harness(self, fail_at=None, lsm=False, unexpected=False):
+    def harness(self, fail_at=None, lsm=False, unexpected=False, local_files=False):
+        if local_files:
+            self.config = replace(self.config, local_lsm=self.directory / "local.json")
         if lsm:
             self.config = Config(self.config.policy, self.config.enforcement, self.config.responses,
                                  self.directory / "lsm.json", shutdown_timeout=1)
@@ -267,6 +317,32 @@ class SupervisionTests(Fixture):
         supervisor, host, _, _ = self.harness(fail_at="preflight")
         self.assertEqual(supervisor.run(), 1)
         self.assertNotIn("arm", host.calls)
+
+    def test_local_files_are_registered_before_usb_arming_and_readiness(self):
+        supervisor, host, output, _ = self.harness(local_files=True)
+        self.assertEqual(supervisor.run(), 0)
+        self.assertLess(host.calls.index("register_local"), host.calls.index("arm"))
+        self.assertLess(host.calls.index("register_local"), host.calls.index(("spawn", "monitor")))
+        ready = next(row for row in output if row["type"] == "service_ready")
+        self.assertEqual(ready["lsm_scope"], "vm-files")
+        self.assertTrue(ready["lsm_enabled"])
+        self.assertIn("restore", host.calls)
+
+    def test_failed_vm_registration_stops_controller_without_arming_or_ready(self):
+        supervisor, host, output, _ = self.harness(local_files=True, fail_at="register_local")
+        self.assertEqual(supervisor.run(), 1)
+        self.assertNotIn("arm", host.calls)
+        self.assertIn(("lsm", signal.SIGINT), host.calls)
+        self.assertFalse(any(row["type"] == "service_ready" for row in output))
+
+    def test_lost_vm_registration_fails_service_and_retains_usb_deny(self):
+        supervisor, host, output, _ = self.harness(local_files=True, fail_at="check_local")
+        supervisor.notifier = lambda message: None
+        self.assertEqual(supervisor.run(), 1)
+        self.assertIn("check_local", host.calls)
+        self.assertNotIn("restore", host.calls)
+        self.assertFalse(output[-1]["ok"])
+        self.assertIn("local guard loss", output[-1]["reason"])
 
     def test_partial_arm_failure_preserves_recovery_state(self):
         supervisor, host, output, _ = self.harness(fail_at="arm")
@@ -447,6 +523,23 @@ class InstallationTests(Fixture):
         with mock.patch.object(module, "components", return_value=(None, SimpleNamespace(state_file=state), None, None)), \
                 self.assertRaises(ServiceError):
             module.payloads(self.config)
+
+    def test_installer_preserves_vm_file_config_and_separate_installed_path(self):
+        module = self.module()
+        self.config.policy.write_text('{}')
+        self.config.enforcement.write_text('{}')
+        self.config.responses.write_text('{}')
+        local = self.directory / "local.json"
+        local.write_text('{"schema_version":1,"socket_path":"/run/portwatchman/lsm_controller.sock",'
+                         '"protected_paths":["/var/tmp/demo/restricted.txt"]}')
+        config = replace(self.config, local_lsm=local)
+        with mock.patch.object(module, "components", return_value=(None, SimpleNamespace(state_file=self.directory / "state"), None, None)):
+            result = module.payloads(config)
+        installed = json.loads(result["service.json"])
+        self.assertEqual(installed["local_lsm"], str(module.ETC / "lsm-local.json"))
+        self.assertIsNone(installed["lsm"])
+        self.assertEqual(result["lsm-local.json"], local.read_bytes())
+        self.assertIn("src/enforcement/lsm_local.py", module.FILES)
 
     def test_install_manifest_excludes_runtime_data_and_discarded_fix(self):
         files = self.module().FILES

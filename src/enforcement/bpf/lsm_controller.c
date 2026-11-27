@@ -18,7 +18,8 @@
 static struct pw_target targets[PW_MAX_TARGETS];
 static struct lsm_guard_bpf *skel;
 static int map_fd = -1;
-static bool loop_mode, attached, output_failed;
+static enum pw_target_mode target_mode = PW_USB;
+static bool attached, output_failed;
 static unsigned failures;
 static uint64_t next_id = 1, retired_denials;
 static volatile sig_atomic_t stop_requested, status_requested;
@@ -30,6 +31,12 @@ static struct pw_socket_server server;
 static char prepared_connections[PW_MAX_TARGETS][256];
 static unsigned next_prepared;
 static const char *string_field(struct json_object *, const char *);
+
+static const char *mode_name(void)
+{
+    return target_mode == PW_LOCAL ? "local-files" :
+           target_mode == PW_LOOPBACK ? "test-loopback" : "usb";
+}
 
 static bool connection_prepared(const char *connection)
 {
@@ -144,6 +151,10 @@ static bool bind_request(struct pw_target *target)
     if (!current_request)
         return true;
     struct json_object *value;
+    if (target_mode == PW_LOCAL &&
+        (json_object_object_get_ex(current_request, "expected_usb_id", &value) ||
+         json_object_object_get_ex(current_request, "expected_address", &value)))
+        return false;
     const char *connection = string_field(current_request, "connection_id");
     if (json_object_object_get_ex(current_request, "connection_id", &value)) {
         if (!connection || !*connection || strlen(connection) >= sizeof(target->connection_id))
@@ -189,7 +200,7 @@ static int add_target(const char *path)
     struct pw_target candidate;
     char message[256], reason[64];
     int slot = -1;
-    if (pw_target_open(path, loop_mode, &candidate, message)) {
+    if (pw_target_open(path, target_mode, &candidate, message)) {
         error_record("invalid_target", message, 0);
         return -1;
     }
@@ -351,7 +362,7 @@ static void status(void)
     json_object_object_add(obj, "failures", json_object_new_int(failures));
     json_object_object_add(obj, "rejected_clients", json_object_new_int(server.rejected_clients));
     json_object_object_add(obj, "rejected_requests", json_object_new_int(server.rejected_requests));
-    json_object_object_add(obj, "mode", json_object_new_string(loop_mode ? "test-loopback" : "usb"));
+    json_object_object_add(obj, "mode", json_object_new_string(mode_name()));
     emit(obj);
 }
 
@@ -420,7 +431,10 @@ static void command(char *line, size_t length)
         emit(ack);
         stop_requested = 1;
     } else if (!strcmp(op, "PREPARE_REMOVE")) {
-        prepare_remove(string_field(obj, "connection_id"));
+        if (target_mode == PW_LOCAL)
+            error_record("unsupported_command", "Local files are independent of USB removal; stop the owning service to release them", 0);
+        else
+            prepare_remove(string_field(obj, "connection_id"));
     } else if (!strcmp(op, "ADD") || !strcmp(op, "restrict")) {
         const char *path = string_field(obj, "path");
         if (!path)
@@ -505,13 +519,14 @@ static bool prerequisites(void)
 
 int main(int argc, char **argv)
 {
-    bool check = false, inspect = false, control = false;
+    bool check = false, inspect = false, control = false, mode_selected = false;
     const char *socket_path = "/run/portwatchman/lsm_controller.sock";
     char input[65537];
     size_t used = 0;
     int option, result = EXIT_FAILURE, stdin_flags = -1;
     static const struct option options[] = {
         {"usb", no_argument, NULL, 'u'}, {"test-loopback", no_argument, NULL, 'l'},
+        {"local-files", no_argument, NULL, 'L'},
         {"control-stdin", no_argument, NULL, 'c'}, {"check", no_argument, NULL, 'k'},
         {"serve", no_argument, NULL, 'S'}, {"socket", required_argument, NULL, 's'},
         {"inspect", no_argument, NULL, 'i'}, {"help", no_argument, NULL, 'h'}, {NULL, 0, NULL, 0}
@@ -523,17 +538,23 @@ int main(int argc, char **argv)
         targets[i].fd = targets[i].node_fd = -1;
     while ((option = getopt_long(argc, argv, "", options, NULL)) != -1) {
         switch (option) {
-        case 'u': loop_mode = false; break;
-        case 'l': loop_mode = true; break;
+        case 'u': case 'l': case 'L':
+            if (mode_selected) {
+                fputs("Choose exactly one target mode\n", stderr);
+                return 2;
+            }
+            mode_selected = true;
+            target_mode = option == 'L' ? PW_LOCAL : option == 'l' ? PW_LOOPBACK : PW_USB;
+            break;
         case 'c': control = true; break;
         case 'S': serving = true; break;
         case 's': serving = true; socket_path = optarg; break;
         case 'k': check = true; break;
         case 'i': inspect = true; break;
         case 'h':
-            puts("Usage: lsm_controller [--usb|--test-loopback] --serve [--socket PATH] [FILE...]\n"
-                 "       lsm_controller [--usb|--test-loopback] [--control-stdin] FILE...\n"
-                 "       lsm_controller --inspect [--usb|--test-loopback] FILE\n"
+            puts("Usage: lsm_controller [--local-files|--usb|--test-loopback] --serve [--socket PATH] [FILE...]\n"
+                 "       lsm_controller [--local-files|--usb|--test-loopback] [--control-stdin] FILE...\n"
+                 "       lsm_controller --inspect [--local-files|--usb|--test-loopback] FILE\n"
                  "       lsm_controller --check\n"
                  "SIGUSR1 requests status; SIGINT/SIGTERM stop and detach.");
             return 0;
@@ -628,7 +649,7 @@ int main(int argc, char **argv)
         if (targets[i].used)
             target_event("lsm_target_added", &targets[i], NULL, 0);
     struct json_object *ready = record("lsm_ready");
-    json_object_object_add(ready, "mode", json_object_new_string(loop_mode ? "test-loopback" : "usb"));
+    json_object_object_add(ready, "mode", json_object_new_string(mode_name()));
     json_object_object_add(ready, "scope", json_object_new_string("new data opens of selected file identities"));
     if (serving)
         json_object_object_add(ready, "socket_path", json_object_new_string(server.path));

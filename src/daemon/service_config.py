@@ -41,6 +41,15 @@ class Config:
     startup_timeout: float = 90
     shutdown_timeout: float = 30
     command_timeout: float = 60
+    local_lsm: Path | None = None
+
+    @property
+    def lsm_enabled(self):
+        return self.lsm is not None or self.local_lsm is not None
+
+    @property
+    def lsm_scope(self):
+        return "vm-files" if self.local_lsm else "usb-files" if self.lsm else "disabled"
 
 
 def load_config(path):
@@ -49,7 +58,7 @@ def load_config(path):
         raise ServiceError("Service configuration exceeds 64 KiB")
     doc = parse(raw)
     fields = {"schema_version", "policy", "enforcement", "responses", "lsm",
-              "apply_responses", "startup_timeout", "shutdown_timeout", "command_timeout"}
+              "apply_responses", "startup_timeout", "shutdown_timeout", "command_timeout", "local_lsm"}
     if not isinstance(doc, dict) or set(doc) - fields:
         raise ServiceError("Service configuration must be an object with known fields")
     if type(doc.get("schema_version")) is not int or doc["schema_version"] != 1:
@@ -63,6 +72,8 @@ def load_config(path):
     apply = doc.get("apply_responses", False)
     if type(apply) is not bool:
         raise ServiceError("apply_responses must be true or false")
+    if doc.get("lsm") is not None and doc.get("local_lsm") is not None:
+        raise ServiceError("Choose local_lsm for VM files or legacy lsm for USB files, not both")
     times = {}
     for name, default, maximum in (("startup_timeout", 90, 120),
                                    ("shutdown_timeout", 30, 60), ("command_timeout", 60, 60)):
@@ -74,7 +85,8 @@ def load_config(path):
                   filename("enforcement", "config/enforcement.json"),
                   filename("responses", "config/responses.json"),
                   filename("lsm", None) if doc.get("lsm") is not None else None,
-                  apply, **times)
+                  apply, local_lsm=filename("local_lsm", None) if doc.get("local_lsm") is not None else None,
+                  **times)
 
 
 def commands(config):
@@ -105,6 +117,11 @@ def components(config):
     policy = load_policy(config.policy)
     enforcement = load_enforcement(config.enforcement)
     response = load_responses(config.responses)
+    if config.local_lsm:
+        if config.lsm:
+            raise ServiceError("Choose local_lsm or legacy lsm, not both")
+        from lsm_local import load_local_config, check_response_overlap
+        check_response_overlap(load_local_config(config.local_lsm), response)
     bridge = None
     if config.lsm:
         from lsm_bridge import load_bridge_config

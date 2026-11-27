@@ -54,6 +54,29 @@ class NativeControllerTests(unittest.TestCase):
     def test_host_filesystem_is_not_accepted_as_loop(self):
         self.rejected("--test-loopback", "--inspect", self.file)
 
+    def test_local_mode_accepts_internal_vm_regular_file_without_loading_bpf(self):
+        result = self.run_controller("--local-files", "--inspect", self.file.resolve())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        target = next(json.loads(row)["target"] for row in result.stdout.splitlines()
+                      if json.loads(row)["type"] == "lsm_target_inspected")
+        self.assertIsNone(target["usb_id"])
+        self.assertEqual(target["inode"], self.file.stat().st_ino)
+
+    def test_local_mode_rejects_nonregular_missing_and_symlink_targets(self):
+        link = self.root / "local-alias"
+        link.symlink_to(self.file)
+        parent_alias = self.root / "parent-alias"
+        parent_alias.symlink_to(self.root, target_is_directory=True)
+        for path in (self.root, self.root / "missing", link, parent_alias / self.file.name):
+            with self.subTest(path=path):
+                self.rejected("--local-files", "--inspect", path)
+
+    def test_local_mode_rejects_pseudo_filesystems(self):
+        self.rejected("--local-files", "--inspect", "/proc/version")
+
+    def test_target_modes_are_mutually_exclusive(self):
+        self.assertEqual(self.run_controller("--usb", "--local-files", "--inspect", self.file).returncode, 2)
+
     def test_target_limit_is_checked_before_loading(self):
         self.rejected(*([self.file] * 129), reason="invalid_arguments")
 

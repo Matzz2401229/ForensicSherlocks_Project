@@ -4,6 +4,7 @@
   "enforcement": "config/enforcement.json",
   "responses": "config/responses.json",
   "lsm": null,
+  "local_lsm": null,
   "apply_responses": false,
   "startup_timeout": 90,
   "shutdown_timeout": 30,
