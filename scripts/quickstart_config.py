@@ -18,6 +18,7 @@ SELECTION = "logs/quick-files.json"
 DEMO_DIR = "build/test-tmp/quickstart"
 STATE = "logs/quick-state.json"
 DESTROY_FILES = ("quick-responses-destroy.json", "quick-service-destroy.json")
+ALLOW_FILES = ("quick-allow.json", "quick-service-allow.json")
 
 
 class SetupError(Exception):
@@ -83,9 +84,7 @@ def update_selection(root, args):
 
 
 def documents(device, demo, selection, single_bus=False):
-    rule = {"name": "trusted-usb", "vendor_id": device["vendor_id"], "product_id": device["product_id"]}
-    if device.get("serial"):
-        rule["serial"] = device["serial"]
+    """Build every configuration document. device is None when no approved USB is set up."""
 
     def service(policy, responses="logs/quick-responses.json"):
         return {"schema_version": 1, "policy": policy,
@@ -95,8 +94,9 @@ def documents(device, demo, selection, single_bus=False):
                 "apply_responses": False}
 
     paths = list(dict.fromkeys([str(demo / "restricted.txt"), *selection["protect"]]))
+    if single_bus and device is None:
+        raise SetupError("--single-bus needs the drive from step A4; leave out --no-allowed-device")
     docs = {
-        "quick-allow.json": {"schema_version": 1, "default_action": "block", "allowlist": [rule]},
         "quick-block.json": {"schema_version": 1, "default_action": "block", "allowlist": []},
         # "auto" arms every bus, so a device on another port or controller is still blocked.
         "quick-enforcement.json": {"schema_version": 1,
@@ -106,9 +106,14 @@ def documents(device, demo, selection, single_bus=False):
                                  "actions": [{"type": "lock_session"}]},
         "quick-lsm.json": {"schema_version": 1, "socket_path": "/run/portwatchman/lsm_controller.sock",
                            "protected_paths": paths},
-        "quick-service-allow.json": service("logs/quick-allow.json"),
         "quick-service-block.json": service("logs/quick-block.json"),
     }
+    if device is not None:
+        rule = {"name": "trusted-usb", "vendor_id": device["vendor_id"], "product_id": device["product_id"]}
+        if device.get("serial"):
+            rule["serial"] = device["serial"]
+        docs["quick-allow.json"] = {"schema_version": 1, "default_action": "block", "allowlist": [rule]}
+        docs["quick-service-allow.json"] = service("logs/quick-allow.json")
     if selection["destroy"]:
         # Each destroyed entry's folder becomes an allowed root, so deletion stays inside it.
         roots = sorted({str(Path(item).parent) for item in selection["destroy"]})
@@ -145,9 +150,11 @@ def create(root, args):
     if state.exists() or Path(str(state) + ".service-owner.json").exists():
         raise SetupError("A previous run was not restored (logs/quick-state.json exists). "
                          "See 'If something goes wrong' in the quick start.")
-    device = load_device(root / DEVICE)
-    if device["is_root_hub"] or device.get("device_class") == "09":
-        raise SetupError(f"{device['usb_id']} is a hub, not a drive. Pick your flash drive in step A4.")
+    device = None
+    if not args.no_allowed_device:
+        device = load_device(root / DEVICE)
+        if device["is_root_hub"] or device.get("device_class") == "09":
+            raise SetupError(f"{device['usb_id']} is a hub, not a drive. Pick your flash drive in step A4.")
     selection = update_selection(root, args)
 
     demo = (root / DEMO_DIR).resolve()
@@ -159,7 +166,7 @@ def create(root, args):
     logs.mkdir(exist_ok=True)
     (logs / Path(SELECTION).name).write_text(
         json.dumps({"schema_version": 1, **selection}, indent=2) + "\n")
-    for name in DESTROY_FILES:  # do not leave a destroy profile for an emptied list
+    for name in DESTROY_FILES + ALLOW_FILES:  # do not leave profiles that no longer apply
         if name not in docs:
             (logs / name).unlink(missing_ok=True)
     for name, document in docs.items():
@@ -181,6 +188,8 @@ def main(argv=None, root=ROOT):
                         help="Remove an entry from the destroy list (repeatable)")
     parser.add_argument("--reset", action="store_true",
                         help="Forget the saved protect and destroy lists before applying this run's options")
+    parser.add_argument("--no-allowed-device", action="store_true",
+                        help="Skip step A4: no approved USB, so every USB is blocked and no allow profile is made")
     parser.add_argument("--single-bus", action="store_true",
                         help="Manage only the drive's bus instead of every bus (devices on other ports are not blocked)")
     args = parser.parse_args(argv)
@@ -189,7 +198,12 @@ def main(argv=None, root=ROOT):
     except SetupError as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1
-    print(f"Drive:            {describe(device)}")
+    if device is None:
+        print("Drive:            none (--no-allowed-device): every USB is unapproved and blocked")
+        print("WARNING: no allow profile was created, so test B1 cannot run. To show an approved USB")
+        print("         later, do step A4 and run this command again without --no-allowed-device.")
+    else:
+        print(f"Drive:            {describe(device)}")
     buses = docs["quick-enforcement.json"]["managed_buses"]
     print(f"Managed USB buses: {'all (auto)' if buses == 'auto' else ', '.join(buses)}")
     destroyed = set(selection["destroy"])
@@ -202,7 +216,8 @@ def main(argv=None, root=ROOT):
             print(f"  {path}")
     print(f"Selection saved in {SELECTION}; run again with --protect/--unprotect/--destroy/--undestroy to change it.")
     print("Configuration created in logs/. Next, check the profiles:")
-    print("  sudo python3 src/daemon/portwatchman.py --config logs/quick-service-allow.json check")
+    if device is not None:
+        print("  sudo python3 src/daemon/portwatchman.py --config logs/quick-service-allow.json check")
     print("  sudo python3 src/daemon/portwatchman.py --config logs/quick-service-block.json check")
     if selection["destroy"]:
         print("  sudo python3 src/daemon/portwatchman.py --config logs/quick-service-destroy.json check")

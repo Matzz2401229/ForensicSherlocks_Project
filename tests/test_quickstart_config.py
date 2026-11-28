@@ -168,6 +168,31 @@ class QuickstartConfigTests(unittest.TestCase):
         config = load_responses(self.root / "logs" / "quick-responses-destroy.json")
         self.assertEqual(config.actions[-1]["type"], "power")
 
+    def test_no_allowed_device_skips_step_a4_and_the_allow_profile(self):
+        (self.root / "logs" / "quick-device.json").unlink()
+        evidence = self.make("evidence.txt")
+        code, out, _ = self.run_main("--no-allowed-device", "--protect", str(evidence), "--destroy", str(evidence))
+        self.assertEqual(code, 0)
+        self.assertIn("WARNING: no allow profile", out)
+        self.assertNotIn("quick-service-allow.json check", out)
+        for name in quickstart_config.ALLOW_FILES:
+            self.assertFalse((self.root / "logs" / name).exists())
+        self.assertEqual(self.load("quick-block.json")["allowlist"], [])
+        self.assertEqual(self.load("quick-enforcement.json")["managed_buses"], "auto")
+        self.assertTrue((self.root / "logs" / "quick-service-destroy.json").exists())
+
+    def test_no_allowed_device_removes_an_earlier_allow_profile(self):
+        self.run_main()
+        self.assertTrue((self.root / "logs" / "quick-service-allow.json").exists())
+        self.run_main("--no-allowed-device")
+        for name in quickstart_config.ALLOW_FILES:
+            self.assertFalse((self.root / "logs" / name).exists())
+
+    def test_single_bus_needs_the_drive(self):
+        code, _, err = self.run_main("--no-allowed-device", "--single-bus")
+        self.assertEqual(code, 1)
+        self.assertIn("--single-bus needs the drive", err)
+
     def test_symlinked_folder_is_stored_as_real_path(self):
         real = self.root / "real"
         real.mkdir()

@@ -87,6 +87,14 @@ if either fails.
 
 ### A4. Identify your USB drive
 
+This step sets up the approved USB, the device PortWatchman will allow.
+
+> **Skipping A4 (not recommended).** You can leave it out and add
+> `--no-allowed-device` to the A5 command. Every USB is then unapproved and blocked,
+> no allow profile is created, and test B1 cannot run, so you cannot show that an
+> approved device still works. To add an approved USB later, do A4 and run A5 again
+> without `--no-allowed-device`.
+
 Plug in the drive and connect it to the VM (**VM > Removable Devices**). Then:
 
 ```bash
@@ -188,7 +196,8 @@ Skip the third command if you did not use `--destroy`.
 | `quick-service-block.json` | Not on the allowlist | An unapproved device |
 | `quick-service-destroy.json` | Not on the allowlist | The full lock, destroy and power-off response |
 
-One drive is enough for both tests.
+One drive is enough for all of these tests. If you used `--no-allowed-device`,
+skip the first `check` command; there is no allow profile.
 
 Now unmount the drive (use the eject icon in Files), then disconnect it from the
 VM. **Keep it disconnected until a test says to connect it.**
@@ -462,7 +471,7 @@ Turn the service off afterwards with B4's `disable --now` command.
 Restore after a failure (stop the service first):
 
 ```bash
-sudo python3 src/daemon/portwatchman.py --config logs/quick-service-allow.json restore
+sudo python3 src/daemon/portwatchman.py --config logs/quick-service-block.json restore
 ```
 
 A drive that was blocked stays blocked until you disconnect and reconnect it.
