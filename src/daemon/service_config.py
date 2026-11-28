@@ -120,8 +120,10 @@ def components(config):
     if config.local_lsm:
         if config.lsm:
             raise ServiceError("Choose local_lsm or legacy lsm, not both")
-        from lsm_local import load_local_config, check_response_overlap
-        check_response_overlap(load_local_config(config.local_lsm), response)
+        # Guarded files may also be on the response stage's delete list: the service
+        # exempts that stage from the guard, so it can destroy them on a trigger.
+        from lsm_local import load_local_config
+        load_local_config(config.local_lsm)
     bridge = None
     if config.lsm:
         from lsm_bridge import load_bridge_config

@@ -10,6 +10,10 @@ This guide is for users operating the tool in an Ubuntu virtual machine or
 reviewing its behaviour for a demonstration. PortWatchman is an academic prototype;
 the [limitations](#limitations) describe the boundaries of its protection.
 
+New to PortWatchman? Start with the [quick start](../QUICKSTART.md): Part A sets it
+up and configures it, Part B tests each behaviour. For a project overview, see the
+[README](../README.md).
+
 ## Contents
 
 - [How it works](#how-it-works)
@@ -577,8 +581,17 @@ The same denial applies to ordinary applications and root processes. This is not
 a trusted-application policy, malware detector, general copying firewall or memory
 dump prevention mechanism. Use disposable demonstration files first. Do not select
 the interpreter, service code/configuration, system programs or files needed to
-operate the VM. Files selected for deletion/sanitisation must be separate from the
-protected files: configured overlaps are rejected, and the guard is never bypassed.
+operate the VM.
+
+Protected files can also be listed in a delete response (see [Configure response
+actions](#configure-response-actions)). When the service starts its response stage,
+it exempts that one process from the guard, so on an unapproved USB the response
+alone can overwrite and delete them; every other process, including root, is still
+denied. The exemption ends when the response stage exits. A protected file that
+has been destroyed is reported (`service_protected_file_destroyed`) and its guard
+entry released, while the other files stay protected. A protected file that is
+missing when the service starts is skipped (`service_protected_file_missing`), so
+the other files and USB blocking still start.
 
 ### Build the controller
 
@@ -712,8 +725,8 @@ selected files on an approved USB after mounting. That is a separate mode, with
 USB connection ownership and `PREPARE_REMOVE` before unmounting a protected drive.
 It is not VM-file protection. A service profile must choose either `local_lsm` or
 legacy `lsm`; both cannot be enabled together. See
-[the legacy bridge guide](docs/STEP6-TESTING.md) for that mode, and
-[VM-file verification](docs/VM-FILE-PROTECTION-TESTING.md) for the current VM use.
+[the legacy bridge guide](STEP6-TESTING.md) for that mode, and
+[VM-file verification](VM-FILE-PROTECTION-TESTING.md) for the current VM use.
 
 ## Configure response actions
 
@@ -932,7 +945,7 @@ an update. Change installed settings explicitly while stopped and validate them.
 
 ## Limitations
 
-- Only selected buses are managed. Current startup handling covers new connections
+- Only the configured buses are managed (`"auto"` manages every bus). Current startup handling covers new connections
   after readiness; existing devices and pre-start access are not automatically
   reconciled or revoked. There is no complete boot-time prevention guarantee.
 - Vendor/product IDs and serials are reported by devices and can be spoofed.
@@ -944,8 +957,10 @@ an update. Change installed settings explicitly while stopped and validate them.
   be deleted, replaced by a rename or truncated, even by root. It does not cover pre-existing
   data descriptors, mmap, raw-device access or whole volumes. VM files are enrolled
   before service readiness; legacy USB-file mode registers after authorisation/
-  mounting. Controller exit removes either mode's restrictions. No application
-  exemption or general memory-dump prevention is provided.
+  mounting. Controller exit removes either mode's restrictions. The only exemption
+  is the service's own response stage, granted by process ID while that process runs;
+  any root process able to reach the controller socket could request one, but root
+  can already stop the service. No general memory-dump prevention is provided.
 - The service does not mount filesystems. The verified boot use involves a desktop
   session and a drive connected after readiness; unattended mounting is not provided.
 - Responses run synchronously. A long action can delay reading later events beyond

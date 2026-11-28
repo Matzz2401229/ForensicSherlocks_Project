@@ -17,7 +17,13 @@
 
 static struct pw_target targets[PW_MAX_TARGETS];
 static struct lsm_guard_bpf *skel;
-static int map_fd = -1;
+static int map_fd = -1, exempt_fd = -1;
+/* Exempted processes, identified by PID plus start time so a reused PID is never trusted. */
+static struct {
+    bool used;
+    uint32_t pid;
+    unsigned long long start;
+} exempted[PW_MAX_EXEMPT];
 static enum pw_target_mode target_mode = PW_USB;
 static bool attached, output_failed;
 static unsigned failures;
@@ -322,15 +328,103 @@ static void prepare_remove(const char *connection)
         prepared_reply(connection, removed, false);
 }
 
+/* Start time (clock ticks since boot, field 22 of /proc/PID/stat), or 0 if the process is gone. */
+static unsigned long long process_start(uint32_t pid)
+{
+    char path[64], text[1024];
+    snprintf(path, sizeof(path), "/proc/%u/stat", pid);
+    FILE *source = fopen(path, "re");
+    if (!source)
+        return 0;
+    size_t count = fread(text, 1, sizeof(text) - 1, source);
+    fclose(source);
+    text[count] = '\0';
+    char *field = strrchr(text, ')'); /* the command name may itself contain spaces */
+    if (!field)
+        return 0;
+    field++;
+    for (int position = 3; position < 22; position++) {
+        field = strchr(field + 1, ' ');
+        if (!field)
+            return 0;
+    }
+    return strtoull(field + 1, NULL, 10);
+}
+
+static void exempt_event(const char *type, uint32_t pid)
+{
+    struct json_object *obj = record(type);
+    json_object_object_add(obj, "pid", json_object_new_int64(pid));
+    emit(obj);
+}
+
+static void exempt_process(struct json_object *obj)
+{
+    struct json_object *value;
+    if (!json_object_object_get_ex(obj, "pid", &value) || !json_object_is_type(value, json_type_int) ||
+        json_object_get_int64(value) <= 1 || json_object_get_int64(value) > 4194304) {
+        error_record("invalid_command", "EXEMPT requires the integer pid of a running process", 0);
+        return;
+    }
+    uint32_t pid = (uint32_t)json_object_get_int64(value);
+    unsigned long long start = process_start(pid);
+    if (!start) {
+        error_record("invalid_command", "EXEMPT process is not running", 0);
+        return;
+    }
+    int slot = -1;
+    for (int i = 0; i < PW_MAX_EXEMPT; i++) {
+        if (exempted[i].used && exempted[i].pid == pid && exempted[i].start == start) {
+            exempt_event("lsm_exempted", pid);
+            return;
+        }
+        if (!exempted[i].used && slot < 0)
+            slot = i;
+    }
+    __u8 one = 1;
+    if (slot < 0) {
+        error_record("exempt_limit", "Too many exempted processes", 0);
+        return;
+    }
+    if (bpf_map_update_elem(exempt_fd, &pid, &one, BPF_ANY)) {
+        error_record("map_update_failed", strerror(errno), 0);
+        return;
+    }
+    exempted[slot].used = true;
+    exempted[slot].pid = pid;
+    exempted[slot].start = start;
+    exempt_event("lsm_exempted", pid);
+}
+
+/* Drop an exemption as soon as its process exits, before the PID can be reused. */
+static void expire_exemptions(void)
+{
+    for (int i = 0; i < PW_MAX_EXEMPT && !stop_requested; i++) {
+        if (!exempted[i].used || process_start(exempted[i].pid) == exempted[i].start)
+            continue;
+        if (bpf_map_delete_elem(exempt_fd, &exempted[i].pid) && errno != ENOENT) {
+            error_record("map_delete_failed", strerror(errno), 0);
+            stop_requested = 1;
+            return;
+        }
+        exempted[i].used = false;
+        exempt_event("lsm_exempt_ended", exempted[i].pid);
+    }
+}
+
 static void expire_targets(void)
 {
     char reason[64];
     for (int i = 0; i < PW_MAX_TARGETS && !stop_requested; i++) {
         if (targets[i].used && !pw_target_alive(&targets[i], reason)) {
             /* A departed device/mount is ordinary lifecycle cleanup. The bridge
-             * detects an unexpected missing registration while still connected. */
-            if (strcmp(reason, "device_disconnected") && strcmp(reason, "device_changed") &&
-                strcmp(reason, "mount_unavailable"))
+             * detects an unexpected missing registration while still connected.
+             * In local-files mode only an exempted process can unlink a target, so an
+             * unlinked VM file was destroyed by the response stage: report it, not an error. */
+            bool lifecycle = !strcmp(reason, "device_disconnected") || !strcmp(reason, "device_changed") ||
+                             !strcmp(reason, "mount_unavailable") ||
+                             (target_mode == PW_LOCAL && !strcmp(reason, "target_unlinked"));
+            if (!lifecycle)
                 error_record("target_expired", reason, targets[i].id);
             remove_target(&targets[i], reason);
         }
@@ -361,6 +455,11 @@ static void status(void)
         if (*prepared_connections[i])
             json_object_array_add(prepared, json_object_new_string(prepared_connections[i]));
     json_object_object_add(obj, "prepared_connections", prepared);
+    struct json_object *exempt_pids = json_object_new_array();
+    for (int i = 0; i < PW_MAX_EXEMPT; i++)
+        if (exempted[i].used)
+            json_object_array_add(exempt_pids, json_object_new_int64(exempted[i].pid));
+    json_object_object_add(obj, "exempt_pids", exempt_pids);
     json_object_object_add(obj, "enforcement_active", json_object_new_boolean(attached));
     json_object_object_add(obj, "denied_opens", json_object_new_int64(total.denied_opens));
     json_object_object_add(obj, "denied_changes", json_object_new_int64(total.denied_changes));
@@ -424,7 +523,8 @@ static void command(char *line, size_t length)
             strcmp(key, "path") && strcmp(key, "target_id") && strcmp(key, "connection_id") &&
             strcmp(key, "expected_controller_id") && strcmp(key, "expected_usb_id") &&
             strcmp(key, "expected_address") && strcmp(key, "expected_major") &&
-            strcmp(key, "expected_minor") && strcmp(key, "expected_inode") && strcmp(key, "expected_mount_id"))
+            strcmp(key, "expected_minor") && strcmp(key, "expected_inode") && strcmp(key, "expected_mount_id") &&
+            strcmp(key, "pid"))
             op = NULL;
     }
     if (!op) {
@@ -440,6 +540,11 @@ static void command(char *line, size_t length)
             error_record("unsupported_command", "Local files are independent of USB removal; stop the owning service to release them", 0);
         else
             prepare_remove(string_field(obj, "connection_id"));
+    } else if (!strcmp(op, "EXEMPT")) {
+        if (exempt_fd < 0)
+            error_record("unsupported_command", "EXEMPT needs a loaded guard", 0);
+        else
+            exempt_process(obj);
     } else if (!strcmp(op, "ADD") || !strcmp(op, "restrict")) {
         const char *path = string_field(obj, "path");
         if (!path)
@@ -468,7 +573,7 @@ static void command(char *line, size_t length)
             emit(absent);
         }
     } else {
-        error_record("invalid_command", "Use ADD, REMOVE, LIST, STATUS, PREPARE_REMOVE, or STOP", 0);
+        error_record("invalid_command", "Use ADD, REMOVE, LIST, STATUS, EXEMPT, PREPARE_REMOVE, or STOP", 0);
     }
     request_id = current_request = NULL;
     json_object_put(obj);
@@ -561,7 +666,8 @@ int main(int argc, char **argv)
                  "       lsm_controller [--local-files|--usb|--test-loopback] [--control-stdin] FILE...\n"
                  "       lsm_controller --inspect [--local-files|--usb|--test-loopback] FILE\n"
                  "       lsm_controller --check\n"
-                 "SIGUSR1 requests status; SIGINT/SIGTERM stop and detach.");
+                 "SIGUSR1 requests status; SIGINT/SIGTERM stop and detach.\n"
+                 "EXEMPT {\"pid\": N} lets one running process through the guard until it exits.");
             return 0;
         default: return 2;
         }
@@ -625,8 +731,9 @@ int main(int argc, char **argv)
         goto done;
     }
     map_fd = bpf_map__fd(skel->maps.target_map);
-    if (map_fd < 0) {
-        error_record("map_unavailable", "Cannot obtain target_map", 0);
+    exempt_fd = bpf_map__fd(skel->maps.exempt_map);
+    if (map_fd < 0 || exempt_fd < 0) {
+        error_record("map_unavailable", "Cannot obtain the guard maps", 0);
         goto done;
     }
     for (int i = 0; i < PW_MAX_TARGETS; i++) {
@@ -667,6 +774,7 @@ int main(int argc, char **argv)
         }
     }
     while (!stop_requested) {
+        expire_exemptions();
         expire_targets();
         if (status_requested) {
             status_requested = 0;

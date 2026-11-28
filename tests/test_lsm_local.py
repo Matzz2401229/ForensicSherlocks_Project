@@ -11,7 +11,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src/enforcement"))
 sys.path.insert(0, str(ROOT / "src/responses"))
-from lsm_local import LocalFileGuard, LocalGuardConfig, LocalGuardError, check_response_overlap, load_local_config
+from lsm_local import LocalFileGuard, LocalGuardConfig, LocalGuardError, load_local_config
 
 
 class LocalConfigTests(unittest.TestCase):
@@ -56,34 +56,6 @@ class LocalConfigTests(unittest.TestCase):
         with self.assertRaises(LocalGuardError):
             load_local_config(self.path)
 
-    def test_cleanup_same_file_or_parent_refused(self):
-        config = self.load()
-        for action in ({"type": "delete", "paths": ["/var/tmp/demo"]},
-                       {"type": "delete", "paths": ["/var/tmp/demo/restricted.txt"]}):
-            with self.subTest(action=action), self.assertRaises(LocalGuardError):
-                check_response_overlap(config, SimpleNamespace(actions=[action]))
-
-    def test_sanitise_overlap_refused_but_other_actions_allowed(self):
-        config = LocalGuardConfig("/run/portwatchman/lsm_controller.sock", ("/home/demo/.bash_history",))
-        with self.assertRaises(LocalGuardError):
-            check_response_overlap(config, SimpleNamespace(actions=[{
-                "type": "sanitise", "home_dirs": ["/home/demo"], "items": ["shell_history"]}]))
-        check_response_overlap(config, SimpleNamespace(actions=[{"type": "lock_session"},
-            {"type": "power", "mode": "poweroff"},
-            {"type": "delete", "paths": ["/var/tmp/other-demo"]},
-            {"type": "sanitise", "home_dirs": [], "items": ["drop_caches"]}]))
-
-    @unittest.skipUnless(sys.platform == "linux", "Linux hard-link semantics")
-    def test_direct_cleanup_hardlink_alias_refused(self):
-        original = Path(self.temp.name) / "original"
-        original.write_text("fixture")
-        alias = original.with_name("alias")
-        os.link(original, alias)
-        with self.assertRaises(LocalGuardError):
-            check_response_overlap(LocalGuardConfig("/run/pw/guard.sock", (str(original.resolve()),)),
-                                   SimpleNamespace(actions=[{"type": "delete", "paths": [str(alias)]}]))
-
-
 class FakeClient:
     def __init__(self):
         self.controller_id = "fixture-controller"
@@ -101,6 +73,8 @@ class FakeClient:
 
     def request(self, command, **fields):
         self.calls.append((command, fields))
+        if command == "EXEMPT":
+            return {"type": "lsm_exempted", "pid": fields["pid"]}
         if self.reject_add == len(self.calls):
             raise LocalGuardError("Injected ADD failure")
         target = {name.removeprefix("expected_"): value for name, value in fields.items()
@@ -120,7 +94,9 @@ class LocalRegistrationTests(unittest.TestCase):
         self.close = self.closed.start()
         self.addCleanup(self.closed.stop)
         self.inspect_calls = []
-        self.guard = LocalFileGuard(self.config, client=self.client, inspect=self.inspect, clock=lambda: self.time)
+        self.present = set(self.config.protected_paths)
+        self.guard = LocalFileGuard(self.config, client=self.client, inspect=self.inspect,
+                                    clock=lambda: self.time, exists=self.present.__contains__)
 
     def inspect(self, path):
         self.inspect_calls.append(path)
@@ -156,14 +132,50 @@ class LocalRegistrationTests(unittest.TestCase):
 
     def test_removed_target_is_failure(self):
         self.guard.start()
-        self.client.targets.pop()
+        self.client.targets.pop()  # entry gone but the file is still there
         with self.assertRaisesRegex(LocalGuardError, "disappeared"):
             self.guard.verify()
+
+    def test_destroyed_file_is_reported_and_others_stay_guarded(self):
+        self.guard.start()
+        self.client.targets.pop()  # the controller dropped the unlinked file
+        self.present.discard("/vm/second")
+        self.assertEqual(self.guard.verify(), ["/vm/second"])
+        self.assertEqual(list(self.guard.targets), [1])
+        self.assertEqual(self.guard.lost, ["/vm/second"])
+        self.time += 2
+        self.assertEqual(self.guard.tick(), [])  # reported once; the remaining file still verifies
+
+    def test_missing_file_at_start_is_skipped(self):
+        self.present.discard("/vm/first")
+        event = self.guard.start()
+        self.assertTrue(event["protection_complete"])
+        self.assertEqual(event["missing_paths"], ["/vm/first"])
+        self.assertEqual(event["protected_paths"], ["/vm/second"])
+        self.assertEqual(self.inspect_calls, ["/vm/second"])
+        self.assertEqual(len(self.client.targets), 1)
+
+    def test_all_files_missing_still_starts_with_none_guarded(self):
+        self.present.clear()
+        event = self.guard.start()
+        self.assertEqual(event["protected_paths"], [])
+        self.assertFalse(self.client.calls)
+
+    def test_exempts_the_response_process(self):
+        self.guard.start()
+        self.assertEqual(self.guard.exempt(4321), {"schema_version": 1, "type": "lsm_local_exempted", "pid": 4321})
+        self.assertEqual(self.client.calls[-1], ("EXEMPT", {"pid": 4321}))
+
+    def test_unconfirmed_exemption_is_failure(self):
+        self.client.request = lambda command, **fields: {"type": "lsm_status"}
+        with self.assertRaisesRegex(LocalGuardError, "exemption"):
+            self.guard.exempt(4321)
 
     def test_replaced_or_foreign_identity_is_failure(self):
         for key, value in (("inode", 1234), ("mount_id", 99), ("connection_id", "another-owner"), ("usb_id", "3-2")):
             self.client = FakeClient()
-            self.guard = LocalFileGuard(self.config, client=self.client, inspect=self.inspect)
+            self.guard = LocalFileGuard(self.config, client=self.client, inspect=self.inspect,
+                                        exists=self.present.__contains__)
             self.guard.start()
             self.client.targets[0][key] = value
             with self.subTest(key=key), self.assertRaises(LocalGuardError):

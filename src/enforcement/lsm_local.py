@@ -56,34 +56,6 @@ def load_local_config(path):
         raise LocalGuardError(f"Invalid local-file LSM config: {error}") from error
 
 
-def check_response_overlap(config, responses):
-    """Refuse declared cleanup of the same file or its containing directory.
-
-    This checks configured paths/aliases and existing direct hard links, not
-    arbitrary future filesystem changes. The guard is never bypassed for cleanup.
-    """
-    from responses import SANITISE_ITEMS
-    cleanup = []
-    for action in responses.actions:
-        if action["type"] == "delete":
-            cleanup.extend(Path(value) for value in action["paths"])
-        elif action["type"] == "sanitise":
-            cleanup.extend(Path(home) / relative for home in action["home_dirs"]
-                           for item in action["items"] for relative in SANITISE_ITEMS[item])
-    for value in config.protected_paths:
-        protected = Path(value).resolve()
-        for entry in cleanup:
-            selected = entry.resolve()
-            overlap = protected == selected or selected in protected.parents
-            if not overlap:
-                try:
-                    overlap = protected.samefile(selected)
-                except FileNotFoundError:
-                    pass
-            if overlap:
-                raise LocalGuardError(f"VM protection overlaps response cleanup: {value} and {entry}; choose separate targets")
-
-
 def inspect_file(value):
     """Return a held descriptor and identity without opening the file for data."""
     descriptor = os.open("/", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
@@ -114,15 +86,28 @@ def inspect_file(value):
 
 
 class LocalFileGuard:
-    def __init__(self, config, *, client=None, inspect=inspect_file, clock=time.monotonic):
+    """Registers the configured VM files and checks that they stay guarded.
+
+    The service's response stage is exempted through the controller, so a delete
+    response can destroy guarded files. A guarded file that has gone (its entry
+    dropped by the controller and its path absent) is reported as lost rather than
+    treated as a failure, and a file already missing at start-up is skipped, so the
+    rest of the files and USB blocking keep working.
+    """
+
+    def __init__(self, config, *, client=None, inspect=inspect_file, clock=time.monotonic,
+                 exists=os.path.lexists):
         self.config = config
         self.client = client or LsmClient(config.socket_path)
         self.inspect = inspect
         self.clock = clock
+        self.exists = exists
         # The protocol calls this connection_id; here it owns a service generation,
         # never a USB connection. USB lifecycle events do not touch these entries.
         self.owner_id = "local:" + uuid.uuid4().hex
         self.targets = {}
+        self.missing = []
+        self.lost = []
         self.next_check = 0
 
     def _state(self):
@@ -138,10 +123,13 @@ class LocalFileGuard:
             raise LocalGuardError("Local-file controller must start with an empty registry")
         held = []
         identities = set()
+        self.missing = [value for value in self.config.protected_paths if not self.exists(value)]
         try:
             # Inspect the entire set before changing the map. Hold references
             # through ADD so path replacement cannot reuse a checked inode.
             for value in self.config.protected_paths:
+                if value in self.missing:
+                    continue  # e.g. destroyed by a response before the last shutdown
                 if deadline is not None and self.clock() >= deadline:
                     raise LocalGuardError("VM-file registration startup deadline exceeded")
                 descriptor, fields = self.inspect(value)
@@ -161,7 +149,7 @@ class LocalFileGuard:
                         or target.get("usb_id") is not None
                         or any(target.get(name.removeprefix("expected_")) != expected for name, expected in fields.items())):
                     raise LocalGuardError("Controller did not confirm the expected VM file identity")
-                self.targets[target_id] = dict(target)
+                self.targets[target_id] = dict(target, configured_path=value)
             self.verify()
             if deadline is not None and self.clock() >= deadline:
                 raise LocalGuardError("VM-file registration startup deadline exceeded")
@@ -170,20 +158,37 @@ class LocalFileGuard:
                 os.close(descriptor)
         return {"schema_version": 1, "type": "lsm_local_registered", "mode": "local-files",
                 "controller_id": self.client.controller_id, "owner_id": self.owner_id,
-                "target_ids": list(self.targets), "protected_paths": list(self.config.protected_paths),
-                "protection_complete": True}
+                "target_ids": list(self.targets),
+                "protected_paths": [target["configured_path"] for target in self.targets.values()],
+                "missing_paths": list(self.missing), "protection_complete": True}
+
+    def exempt(self, pid):
+        """Let one process (the response stage) through the guard until it exits."""
+        reply = self.client.request("EXEMPT", pid=pid)
+        if reply.get("type") != "lsm_exempted" or reply.get("pid") != pid:
+            raise LocalGuardError("Controller did not confirm the response-stage exemption")
+        return {"schema_version": 1, "type": "lsm_local_exempted", "pid": pid}
 
     def verify(self):
+        """Check every registered file; return the paths newly found destroyed."""
         inventory = {row.get("target_id"): row for row in self._state()["targets"]}
-        for target_id, expected in self.targets.items():
-            row = inventory.get(target_id, {})
-            if any(row.get(key) != expected.get(key) for key in
+        lost = []
+        for target_id, expected in list(self.targets.items()):
+            row = inventory.get(target_id)
+            if row is None and not self.exists(expected["configured_path"]):
+                # The controller drops an entry only when the file is unlinked, which the
+                # guard allows for the exempted response stage alone.
+                del self.targets[target_id]
+                lost.append(expected["configured_path"])
+                continue
+            if any((row or {}).get(key) != expected.get(key) for key in
                    ("connection_id", "major", "minor", "inode", "mount_id", "usb_id")):
                 raise LocalGuardError("A required VM-file guard entry disappeared or changed")
-        if len(self.targets) != len(self.config.protected_paths):
-            raise LocalGuardError("VM-file registration is incomplete")
+        self.lost.extend(lost)
         self.next_check = self.clock() + 1
+        return lost
 
     def tick(self):
         if self.clock() >= self.next_check:
-            self.verify()
+            return self.verify()
+        return []

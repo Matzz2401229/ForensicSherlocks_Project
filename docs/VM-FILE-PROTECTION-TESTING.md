@@ -146,14 +146,17 @@ pgrep -af 'lsm_controller|bpftrace.*usb_events[.]bt|src/daemon/portwatchman[.]py
 
 ## Failure and configuration checks
 
-- A missing VM file, directory, symlink, USB file or pseudo-filesystem file must
-  fail preflight, without service readiness or USB arming. Run these against copies
-  of the verification configuration, never by unlinking a real protected file.
-- Configure a delete response for one protected file or its parent, or sanitise
-  for a protected history/trace file: service `validate` must refuse the overlap.
-  Keep legitimate cleanup targets separate. Arbitrary future hard-link aliases or
-  filesystem changes are not fully predicted by this configuration check; attempted
-  data opens of the enrolled inode are still denied rather than exempted.
+- A directory, symlink, USB file or pseudo-filesystem file must fail preflight,
+  without service readiness or USB arming. A configured VM file that does not exist
+  is skipped with `service_protected_file_missing`, and the remaining files are
+  protected. Run these against copies of the verification configuration, never by
+  unlinking a real protected file.
+- A delete response may list protected files. Only the service's response stage is
+  exempted from the guard: with a disposable protected file on the delete list,
+  connect an unapproved USB with responses applied, and check that the file is
+  destroyed, `service_protected_file_destroyed` is logged, and the other protected
+  files are still denied. Manual `responses.py run-action delete --apply` runs are
+  not exempted and are denied while the service runs.
 - Unit tests cover failed local registration before arming and missing-entry
   failure after readiness. The `--local` acceptance run removes a dummy entry and
   confirms its loss is detected. An optional live test may REMOVE one current

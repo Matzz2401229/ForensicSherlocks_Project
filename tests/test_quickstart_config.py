@@ -86,6 +86,88 @@ class QuickstartConfigTests(unittest.TestCase):
         self.assertEqual(paths[1], str(secret.resolve()))
         self.assertIn(str(secret.resolve()), out)
 
+    def make(self, name, text="evidence\n"):
+        path = self.root / name
+        path.write_text(text)
+        return path
+
+    def test_protect_adds_to_the_saved_list_across_runs(self):
+        first, second = self.make("first.txt"), self.make("second.zip")
+        self.assertEqual(self.run_main("--protect", str(first))[0], 0)
+        code, out, _ = self.run_main("--protect", str(second))
+        self.assertEqual(code, 0)
+        paths = self.load("quick-lsm.json")["protected_paths"]
+        self.assertEqual(paths[1:], [str(first.resolve()), str(second.resolve())])
+        self.assertEqual(self.load("quick-files.json")["protect"], paths[1:])
+        self.assertIn(str(first.resolve()), out)
+
+    def test_unprotect_and_reset_change_the_saved_list(self):
+        first, second = self.make("first.txt"), self.make("second.zip")
+        self.run_main("--protect", str(first), "--protect", str(second))
+        self.run_main("--unprotect", str(first))
+        self.assertEqual(self.load("quick-lsm.json")["protected_paths"][1:], [str(second.resolve())])
+        code, _, err = self.run_main("--unprotect", str(first))
+        self.assertEqual(code, 1)
+        self.assertIn("Not in the saved protect list", err)
+        self.run_main("--reset")
+        self.assertEqual(len(self.load("quick-lsm.json")["protected_paths"]), 1)
+        self.assertEqual(self.load("quick-files.json"), {"schema_version": 1, "protect": [], "destroy": []})
+
+    def test_a_saved_file_that_has_gone_is_reported(self):
+        first = self.make("first.txt")
+        self.run_main("--protect", str(first))
+        first.unlink()
+        code, _, err = self.run_main()
+        self.assertEqual(code, 1)
+        self.assertIn("--unprotect", err)
+
+    def test_destroy_creates_a_profile_and_may_include_protected_files(self):
+        evidence = self.make("evidence.txt")
+        folder = self.root / "case"
+        folder.mkdir()
+        code, out, _ = self.run_main("--protect", str(evidence), "--destroy", str(evidence),
+                                     "--destroy", str(folder))
+        self.assertEqual(code, 0)
+        responses = self.load("quick-responses-destroy.json")
+        self.assertEqual([action["type"] for action in responses["actions"]], ["lock_session", "delete", "power"])
+        self.assertEqual(responses["actions"][1]["paths"], [str(evidence.resolve()), str(folder.resolve())])
+        self.assertEqual(responses["actions"][2], {"type": "power", "mode": "poweroff", "method": "graceful"})
+        self.assertEqual(responses["allowed_roots"], [str(self.root.resolve())])
+        service = self.load("quick-service-destroy.json")
+        self.assertEqual(service["responses"], "logs/quick-responses-destroy.json")
+        self.assertEqual(service["policy"], "logs/quick-block.json")
+        self.assertEqual(service["local_lsm"], "logs/quick-lsm.json")
+        self.assertIn("[also destroyed on trigger]", out)
+        self.assertIn("quick-service-destroy.json check", out)
+
+    def test_emptied_destroy_list_removes_the_old_profile(self):
+        evidence = self.make("evidence.txt")
+        self.run_main("--destroy", str(evidence))
+        self.assertTrue((self.root / "logs" / "quick-service-destroy.json").exists())
+        self.run_main("--undestroy", str(evidence))
+        for name in quickstart_config.DESTROY_FILES:
+            self.assertFalse((self.root / "logs" / name).exists())
+
+    def test_refuses_a_symlink_to_destroy(self):
+        target = self.make("evidence.txt")
+        link = self.root / "link.txt"
+        try:
+            link.symlink_to(target)
+        except OSError:
+            self.skipTest("symlinks need extra privileges on this platform")
+        code, _, err = self.run_main("--destroy", str(link))
+        self.assertEqual(code, 1)
+        self.assertIn("not symlinks", err)
+
+    @unittest.skipUnless(sys.platform == "linux", "response roots are Linux paths")
+    def test_destroy_profile_passes_the_response_validator(self):
+        sys.path.insert(0, str(ROOT / "src" / "responses"))
+        from responses import load_config as load_responses
+        evidence = self.make("evidence.txt")
+        self.run_main("--destroy", str(evidence))
+        config = load_responses(self.root / "logs" / "quick-responses-destroy.json")
+        self.assertEqual(config.actions[-1]["type"], "power")
+
     def test_symlinked_folder_is_stored_as_real_path(self):
         real = self.root / "real"
         real.mkdir()
@@ -124,11 +206,11 @@ class QuickstartConfigTests(unittest.TestCase):
             device_file.write_text(content)
             code, _, err = self.run_main()
             self.assertEqual(code, 1)
-            self.assertIn("step 4", err)
+            self.assertIn("step A4", err)
         device_file.unlink()
         code, _, err = self.run_main()
         self.assertEqual(code, 1)
-        self.assertIn("not found. Run step 4 first", err)
+        self.assertIn("not found. Run step A4 first", err)
         self.assertFalse((self.root / "logs" / "quick-allow.json").exists())
 
     def test_refuses_when_previous_run_was_not_restored(self):

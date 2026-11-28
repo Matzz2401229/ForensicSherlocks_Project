@@ -15,8 +15,6 @@ The guide has two parts:
 - An Ubuntu 24.04 desktop VM under VMware, with internet access
 - A USB flash drive that can be passed through to the VM
 - A VM snapshot taken before you start (recommended)
-- A way to control the VM that does not depend on a new USB device (the VMware
-  console, or an SSH session)
 
 Run every command in a terminal **inside the Ubuntu VM**, from the repository
 folder. Stop at the first step that does not show the expected result.
@@ -102,12 +100,35 @@ python3 scripts/quickstart_config.py
 This reads the drive saved in A4, creates the demo files and everything under
 `logs/`, then prints the drive, the managed USB buses and the files it will protect.
 
-To protect extra files of your own as well, add `--protect` once per file. Each
-file must already exist:
+**Choose your files.** Two lists can be set, and a file can be on both:
+
+| Option | List | Effect |
+|---|---|---|
+| `--protect FILE` | Protected files | Nobody can open, change or delete them while PortWatchman runs, not even root |
+| `--destroy PATH` | Destroyed on trigger | When an unapproved USB is connected, the response locks the screen, overwrites and deletes them, then powers off (test B5) |
+
+For example, to protect two evidence files and destroy them if an unapproved USB
+appears:
 
 ```bash
-python3 scripts/quickstart_config.py --protect ~/Desktop/secret.txt
+python3 scripts/quickstart_config.py \
+  --protect ~/Desktop/evidence/notes.txt --protect ~/Desktop/evidence/archive.zip \
+  --destroy ~/Desktop/evidence/notes.txt --destroy ~/Desktop/evidence/archive.zip
 ```
+
+Each file must already exist. The lists are saved in `logs/quick-files.json`, and
+each run adds to them, so you can also add files one run at a time. To change the
+lists later:
+
+| To | Run with |
+|---|---|
+| Remove a protected file | `--unprotect FILE` |
+| Remove a file to destroy | `--undestroy PATH` |
+| Start both lists again | `--reset` |
+| See the current lists | no options (they are printed) |
+
+The response stage is the only process that may pass the file guard, so it can
+destroy protected files while everything else is still denied.
 
 **Managed buses.** By default every USB bus is managed (`"managed_buses": "auto"`),
 so a device plugged into any port is blocked. Add `--single-bus` to manage only the
@@ -128,24 +149,31 @@ The generated files:
 | `logs/quick-enforcement.json` | Managed buses and the saved-state file |
 | `logs/quick-responses.json` | Response plan: lock the screen |
 | `logs/quick-lsm.json` | VM files to protect |
+| `logs/quick-files.json` | Your protect and destroy lists, kept between runs |
 | `logs/quick-service-allow.json` | Service profile using the allowlist with your drive |
 | `logs/quick-service-block.json` | Service profile using the empty allowlist |
+| `logs/quick-responses-destroy.json` | Response plan for B5: lock, destroy, power off (only with `--destroy`) |
+| `logs/quick-service-destroy.json` | Service profile for B5 (only with `--destroy`) |
 
 These files stay as they are until you edit them or run A5 again.
 
-### A6. Check both profiles
+### A6. Check the profiles
 
 ```bash
 sudo python3 src/daemon/portwatchman.py --config logs/quick-service-allow.json check
 sudo python3 src/daemon/portwatchman.py --config logs/quick-service-block.json check
+sudo python3 src/daemon/portwatchman.py --config logs/quick-service-destroy.json check
 ```
 
-**Expect:** `service_preflight_passed` twice.
+Skip the third command if you did not use `--destroy`.
+
+**Expect:** `service_preflight_passed` for each profile.
 
 | Profile | Your USB is | Used to show |
 |---|---|---|
 | `quick-service-allow.json` | On the allowlist | An approved device |
 | `quick-service-block.json` | Not on the allowlist | An unapproved device |
+| `quick-service-destroy.json` | Not on the allowlist | The full lock, destroy and power-off response |
 
 One drive is enough for both tests.
 
@@ -165,13 +193,13 @@ is disconnected and no earlier run is still active (`Ctrl+C` in Terminal A).
 | [B2](#b2-unapproved-usb-preview) | An unapproved USB is blocked; the response is previewed only | block |
 | [B3](#b3-real-screen-lock-response) | The screen-lock response runs for real | block |
 | [B4](#b4-keep-protection-on-across-reboots) | The background service survives closing the terminal and restarting | block |
-| [B5](#b5-full-response-lock-delete-and-power-off) | An unapproved USB locks the screen, deletes the chosen files and powers off; guarded files are left alone | destroy |
+| [B5](#b5-full-response-lock-destroy-and-power-off) | An unapproved USB locks the screen, destroys the chosen files (even protected ones) and powers off | destroy |
 | [B6](#b6-usb-connected-during-boot-known-limitation) | A USB connected while the VM starts is not re-checked (known limitation) | installed block |
 
-The file guard (step 6) and the responses (step 7) are configured separately and
-work on separate files. Guarded files are listed in `logs/quick-lsm.json`; files
-that a response deletes are listed in the response plan. The service refuses to
-start if the two lists overlap.
+The file guard (step 6) and the responses (step 7) work in sequence. While
+PortWatchman runs, the guard keeps the protected files closed to everyone. When an
+unapproved USB is connected, the response stage, the one process the guard lets
+through, can destroy them.
 
 ### B1. Approved USB and file protection
 
@@ -311,62 +339,51 @@ cat build/test-tmp/quickstart/restricted.txt
 **Expect:** the file opens again. `systemctl stop` without `disable` turns it off
 only until the next boot.
 
-### B5. Full response: lock, delete and power off
+### B5. Full response: lock, destroy and power off
 
-This test deletes files and powers off the VM. **Take a VM snapshot first**, and run
+This test destroys files and powers off the VM. **Take a VM snapshot first**, and run
 B4's `disable --now` command if the background service is still running.
 
-**Set up** (configuration step): create disposable files to destroy and a profile
-whose response plan locks the screen, deletes them, then powers off. The files to
-destroy are kept apart from the guarded file.
+It uses the files you added with `--destroy` in A5 (in the example, the two evidence
+files, which are also protected). If you did not add any, run A5 again with
+`--destroy`, then the third A6 command.
+
+**Preview first.** List what would be destroyed (nothing is deleted):
 
 ```bash
-python3 - <<'PY'
-import json
-from pathlib import Path
-
-root = Path("build/test-tmp/quickstart-destroy").resolve()
-(root / "evidence").mkdir(parents=True, exist_ok=True)
-(root / "evidence" / "case-notes.txt").write_text("Disposable file to destroy\n")
-(root / "evidence" / "photo-list.txt").write_text("Second disposable file\n")
-(root / "keep.txt").write_text("Control file outside the delete list\n")
-
-responses = {"schema_version": 1, "cooldown_seconds": 30, "allowed_roots": [str(root)],
-             "actions": [{"type": "lock_session"},
-                         {"type": "delete", "paths": [str(root / "evidence")], "passes": 1},
-                         {"type": "power", "mode": "poweroff", "method": "graceful"}]}
-Path("logs/quick-responses-destroy.json").write_text(json.dumps(responses, indent=2) + "\n")
-service = json.loads(Path("logs/quick-service-block.json").read_text())
-service["responses"] = "logs/quick-responses-destroy.json"
-Path("logs/quick-service-destroy.json").write_text(json.dumps(service, indent=2) + "\n")
-print("Files to destroy:", root / "evidence")
-PY
-
 python3 src/responses/responses.py --config logs/quick-responses-destroy.json validate
 python3 src/responses/responses.py --config logs/quick-responses-destroy.json run-action delete
-sudo python3 src/daemon/portwatchman.py --config logs/quick-service-destroy.json check
 ```
 
-**Expect:** `validate` lists `lock_session`, `delete` and `power`; the `run-action`
-preview lists only the files under `evidence/` in `would_delete` and deletes nothing;
-`check` passes.
+**Expect:** `validate` lists `lock_session`, `delete` and `power`, and `would_delete`
+lists only your chosen files.
 
-**Test, preview first.** Terminal A:
+Terminal A:
 
 ```bash
 sudo python3 src/daemon/portwatchman.py --config logs/quick-service-destroy.json run --summary
 ```
 
-Wait for `Ready.`, connect the USB, and check that Terminal A shows all three
-responses as `preview only, not applied`. Disconnect the drive and press **Ctrl+C**.
+Wait for `Ready.`. Terminal A also shows `Response stage may destroy protected files
+(exempt from the file guard)`. In Terminal B, try to read a protected file you chose,
+for example:
 
-**Test, applied.** Terminal A, saving the output so it survives the power-off:
+```bash
+sudo cat ~/Desktop/evidence/notes.txt
+```
+
+**Expect:** `Permission denied`. Connect the USB and check that Terminal A shows all
+three responses as `preview only, not applied`, and that your files still exist.
+Disconnect the drive and press **Ctrl+C**.
+
+**Applied.** Terminal A, saving the output so it survives the power-off:
 
 ```bash
 sudo python3 src/daemon/portwatchman.py --config logs/quick-service-destroy.json run --apply-responses --summary | tee logs/b5-run.log
 ```
 
-Wait for `Ready.` (it says `APPLIED`), then connect the USB.
+Wait for `Ready.` (it says `APPLIED`). Check once more that the protected file is
+denied in Terminal B, then connect the USB.
 
 **Expect:** the screen locks, then the VM shuts down by itself. A graceful shutdown
 can take a while if Ubuntu is installing updates.
@@ -374,17 +391,20 @@ can take a while if Ubuntu is installing updates.
 Start the VM, log in, and open a terminal in `portwatchman`:
 
 ```bash
-ls build/test-tmp/quickstart-destroy build/test-tmp/quickstart-destroy/evidence
-cat build/test-tmp/quickstart-destroy/keep.txt
+ls -la ~/Desktop/evidence
 cat build/test-tmp/quickstart/restricted.txt
-grep -E 'BLOCKED|Response' logs/b5-run.log
+grep -E 'BLOCKED|Response|destroyed' logs/b5-run.log
 ```
 
-**Expect:** `evidence/` no longer exists, `keep.txt` is still there, and the guarded
-`restricted.txt` still exists and opens (PortWatchman is not running now, so it is
-not guarded). The log shows the block, `Response delete: done` and
-`Response power: issuing now`. The next `run` sets aside the arm state left by the
-power-off automatically.
+**Expect:** the destroyed files are gone. `restricted.txt`, which is protected but not
+on the destroy list, still exists and opens (PortWatchman is not running now). The
+log shows the block, `Response delete: done` and `Response power: issuing now`; it may
+also show `Protected file destroyed` lines if they were written before the shutdown.
+
+The next `run` sets aside the arm state left by the power-off automatically, and
+reports each destroyed file as `Protected file not found, skipped`. Run A5 with
+`--undestroy` and `--unprotect` for them, or revert to your snapshot, before testing
+again.
 
 Deletion overwrites and removes the files. It does not guarantee that no copy is
 left in snapshots, the VM's disk file on the host, or the filesystem journal.
@@ -423,7 +443,7 @@ Turn the service off afterwards with B4's `disable --now` command.
 | `install_service.py` says already installed | Stop it with `sudo systemctl disable --now portwatchman`; see the [update procedure](docs/USER-MANUAL.md#update-the-installed-tool) |
 | `check` reports a missing VM file | Run the A5 command again |
 | No block or allow record when connecting | If you used `--single-bus`, the drive may be on another bus: stop, restore, and repeat A4 and A5 |
-| The VM mouse or keyboard stops working | A virtual device reconnected and was blocked: use the VMware console or SSH, stop PortWatchman and restore |
+| The VM mouse or keyboard stops working | A virtual device reconnected and was blocked: use the VMware console to stop PortWatchman and restore |
 | Screen does not lock | Wait 30 seconds (cooldown) and reconnect; confirm you used `--apply-responses` |
 
 Restore after a failure (stop the service first):

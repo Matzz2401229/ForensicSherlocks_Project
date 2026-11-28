@@ -73,7 +73,7 @@ class LsmClient:
 
     def request(self, command, **fields):
         command = command.upper()
-        if command not in {"ADD", "REMOVE", "LIST", "STATUS", "PREPARE_REMOVE", "STOP"}:
+        if command not in {"ADD", "REMOVE", "LIST", "STATUS", "EXEMPT", "PREPARE_REMOVE", "STOP"}:
             raise LsmClientError("Unknown controller command")
         if any(key in fields for key in ("command", "command_id", "expected_controller_id")):
             raise LsmClientError("Reserved protocol fields cannot be overridden")

@@ -2,7 +2,7 @@
 
 Use this setup for the identification, USB authorisation and BPF-LSM guides.
 Commands use Bash inside the Linux system under test. The validated environment
-is the Ubuntu/VMware configuration recorded in the [README](../README.md).
+is the Ubuntu/VMware configuration recorded in the [user manual](USER-MANUAL.md#supported-environment).
 For a VM, connect the intended USB device to the guest using USB passthrough.
 On a physical Linux host, commands affect that host's devices; that deployment
 has not been validated by this project.

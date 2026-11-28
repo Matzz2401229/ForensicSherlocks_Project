@@ -1,6 +1,8 @@
 #ifndef PORTWATCHMAN_LSM_SHARED_H
 #define PORTWATCHMAN_LSM_SHARED_H
 #define PW_MAX_TARGETS 128
+/* Processes allowed through the guard (the service's own response stage). */
+#define PW_MAX_EXEMPT 8
 struct target_identity {
     __u32 major;
     __u32 minor;

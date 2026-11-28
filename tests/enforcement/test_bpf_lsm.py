@@ -262,6 +262,7 @@ def run_checks(mode, directory, loop_device=None):
     print("PASS: rejected/duplicate commands, oversized input and unexpected control EOF remain failures", flush=True)
     if mode == "--local-files":
         local_socket_checks(files)
+        local_exemption_checks(files)
     else:
         socket_checks(mode, files, loop_device=loop_device)
 
@@ -327,6 +328,119 @@ def local_socket_checks(files):
         current = parent.stat()
         if (current.st_dev, current.st_ino) != (owner.st_dev, owner.st_ino):
             raise RuntimeError("Local test socket directory ownership changed; refusing cleanup")
+        shutil.rmtree(parent)
+
+
+HELPER = r'''
+import os, sys
+for line in sys.stdin:
+    action, path = line.split(" ", 1)
+    path = path.rstrip("\n")
+    try:
+        if action == "read":
+            with open(path, "rb") as stream:
+                stream.read()
+        elif action == "destroy":
+            with open(path, "r+b") as stream:  # overwrite first, as the delete response does
+                stream.write(b"\0" * len(stream.read()))
+            os.unlink(path)
+        print("ok", flush=True)
+    except OSError as error:
+        print(f"errno {error.errno}", flush=True)
+'''
+
+
+class Helper:
+    """A separate process that reads or destroys files on request, to exercise the exemption."""
+
+    def __init__(self):
+        self.process = subprocess.Popen([sys.executable, "-c", HELPER], stdin=subprocess.PIPE,
+                                        stdout=subprocess.PIPE, text=True)
+
+    def run(self, action, path):
+        self.process.stdin.write(f"{action} {path}\n")
+        self.process.stdin.flush()
+        return self.process.stdout.readline().strip()
+
+    def stop(self):
+        self.process.stdin.close()
+        self.process.wait(timeout=10)
+
+
+def local_exemption_checks(files):
+    from lsm_local import LocalFileGuard, LocalGuardConfig, LocalGuardError
+    parent = Path(tempfile.mkdtemp(prefix="portwatchman-exempt-test-", dir="/run"))
+    owner = parent.stat()
+    path = parent / "controller.sock"
+    controller = helper = other = None
+    try:
+        controller = Controller("--local-files", socket_path=path)
+        client = LsmClient(str(path))
+        guard = LocalFileGuard(LocalGuardConfig(str(path), tuple(map(str, files[:2]))), client=client)
+        guard.start()
+        helper, other = Helper(), Helper()
+        assert guard.exempt(helper.process.pid)["pid"] == helper.process.pid
+        assert client.status()["exempt_pids"] == [helper.process.pid]
+        # Only the exempted process passes the guard; everyone else, root included, is still denied.
+        assert helper.run("read", files[0]) == "ok"
+        assert other.run("read", files[0]) == f"errno {errno.EACCES}"
+        denied(files[0])
+        assert other.run("destroy", files[1]) == f"errno {errno.EACCES}"
+        assert helper.run("destroy", files[1]) == "ok" and not files[1].exists()
+        removed = controller.wait_for(lambda row: row["type"] == "lsm_target_removed")
+        assert removed["reason"] == "target_unlinked", removed
+        state = client.status()
+        assert state["failures"] == 0 and len(state["targets"]) == 1, state
+        assert guard.verify() == [str(files[1])]  # reported as destroyed, not a failure
+        denied(files[0])  # the remaining file is still guarded
+        helper.stop()
+        ended = controller.wait_for(lambda row: row["type"] == "lsm_exempt_ended")
+        assert ended["pid"] == helper.process.pid, ended
+        assert client.status()["exempt_pids"] == []
+        assert other.run("read", files[0]) == f"errno {errno.EACCES}"
+        # A file that is gone at start-up is skipped; the others are still guarded.
+        client.request("STOP")
+        closing = controller.wait_for(lambda row: row["type"] == "lsm_stopped")
+        assert closing["ok"] and controller.process.wait(timeout=10) == 0, closing
+        controller.release()
+        controller = Controller("--local-files", socket_path=path)
+        client = LsmClient(str(path))
+        guard = LocalFileGuard(LocalGuardConfig(str(path), tuple(map(str, files[:2]))), client=client)
+        registered = guard.start()
+        assert registered["missing_paths"] == [str(files[1])], registered
+        denied(files[0])
+        client.request("STOP")
+        closing = controller.wait_for(lambda row: row["type"] == "lsm_stopped")
+        assert closing["ok"] and controller.process.wait(timeout=10) == 0, closing
+        controller.release()
+        readable(files[0])
+        # A process that is not running is never exempted (reported as a controller failure).
+        controller = Controller("--local-files", socket_path=path)
+        client = LsmClient(str(path))
+        try:
+            client.request("EXEMPT", pid=2 ** 22)
+        except LsmClientError as error:
+            assert "not running" in str(error)
+        else:
+            raise AssertionError("A process that is not running was exempted")
+        assert client.status()["exempt_pids"] == []
+        client.request("STOP")
+        closing = controller.wait_for(lambda row: row["type"] == "lsm_stopped")
+        assert not closing["ok"] and controller.process.wait(timeout=10) == 1, closing
+        print("PASS: only the exempted process can read or destroy a protected file; destroyed file reported, "
+              "not a failure; exemption ends with its process; missing file skipped at start-up", flush=True)
+    finally:
+        for process in (helper, other):
+            if process and process.process.poll() is None:
+                process.process.kill()
+        if controller:
+            controller.release()
+        if not files[1].exists():
+            with files[1].open("xb") as stream:
+                stream.write(b"PortWatchman fixture\n")
+        current = parent.stat()
+        if (current.st_dev, current.st_ino) != (owner.st_dev, owner.st_ino):
+            raise RuntimeError("Exemption test socket directory ownership changed; refusing cleanup")
         shutil.rmtree(parent)
 
 

@@ -345,6 +345,12 @@ class Host:
                 raise ServiceError("Controller did not confirm a passed preflight")
             if self.local_guard:
                 for path in self.local_guard.config.protected_paths:
+                    if not os.path.lexists(path):
+                        # Possibly destroyed by a response before the last shutdown. Skip it so
+                        # the remaining files and USB blocking still start.
+                        self.emit({"type": "service_protected_file_missing", "path": path,
+                                   "message": "Protected VM file not found; it is skipped"})
+                        continue
                     checked = self.control([str(binary), "--local-files", "--inspect", path])
                     if not any(isinstance(r, dict) and r.get("type") == "lsm_target_inspected" for r in checked):
                         raise ServiceError(f"Controller did not validate VM file: {path}")
@@ -387,11 +393,14 @@ class Host:
     def register_local(self, deadline):
         return self.local_guard.start(deadline=deadline)
 
+    def exempt_responder(self, pid):
+        return self.local_guard.exempt(pid)
+
     def check_local(self, *, force=False):
-        if force:
-            self.local_guard.verify()
-        else:
-            self.local_guard.tick()
+        lost = self.local_guard.verify() if force else self.local_guard.tick()
+        for path in lost:
+            self.emit({"type": "service_protected_file_destroyed", "path": path,
+                       "message": "Protected VM file no longer exists; its guard entry was released"})
 
     def spawn(self, args, stdin):
         env = dict(os.environ)
@@ -594,6 +603,11 @@ class Supervisor:
             self.emit({"type": "service_bus_arm", "event": self.host.arm()})
             plan = commands(self.config)
             response = self.spawn("responses", plan["responses"])
+            if self.config.local_lsm:
+                # Only the response stage may pass the guard, so a delete response can
+                # destroy protected files. Done before any USB event can reach it.
+                exempted = self.host.exempt_responder(response.pid)
+                self.emit({"type": "service_stage_event", "stage": "local", "event": exempted})
             enforce = self.spawn("enforcement", plan["enforcement"], response.stdin)
             policy = self.spawn("policy", plan["policy"], enforce.stdin)
             self.spawn("monitor", plan["monitor"], policy.stdin)

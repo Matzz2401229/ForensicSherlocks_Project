@@ -12,6 +12,21 @@ struct {
     __type(value, struct target_stats);
 } target_map SEC(".maps");
 
+/* Process IDs (thread-group IDs) the guard lets through, so the response stage can
+ * destroy protected files. Keys are added and removed only by the controller. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, PW_MAX_EXEMPT);
+    __type(key, __u32);
+    __type(value, __u8);
+} exempt_map SEC(".maps");
+
+static __always_inline bool exempt(void)
+{
+    __u32 tgid = bpf_get_current_pid_tgid() >> 32;
+    return bpf_map_lookup_elem(&exempt_map, &tgid) != NULL;
+}
+
 static __always_inline struct target_stats *target_of(struct inode *inode)
 {
     struct target_identity key = {};
@@ -29,7 +44,7 @@ static __always_inline struct target_stats *target_of(struct inode *inode)
 static __always_inline int deny_change(struct dentry *dentry)
 {
     struct target_stats *stats = dentry ? target_of(BPF_CORE_READ(dentry, d_inode)) : NULL;
-    if (!stats)
+    if (!stats || exempt())
         return 0;
     __sync_fetch_and_add(&stats->denied_changes, 1);
     return -13; /* EACCES */
@@ -43,7 +58,7 @@ int BPF_PROG(restrict_file_open, struct file *file, int ret)
     if (ret)
         return ret;
     stats = file ? target_of(BPF_CORE_READ(file, f_inode)) : NULL;
-    if (!stats)
+    if (!stats || exempt())
         return 0;
     __sync_fetch_and_add(&stats->denied_opens, 1);
     return -13; /* EACCES; no libc errno headers needed in the BPF build. */

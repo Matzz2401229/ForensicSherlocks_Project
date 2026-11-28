@@ -41,6 +41,10 @@ class Summary:
         if kind == "service_startup_inventory" and record.get("devices"):
             ids = ", ".join(device["usb_id"] for device in record["devices"])
             return f"Already connected before start (not re-checked): {ids}"
+        if kind == "service_protected_file_missing":
+            return f'Protected file not found, skipped: {record.get("path")}'
+        if kind == "service_protected_file_destroyed":
+            return f'Protected file destroyed: {record.get("path")}'
         if kind == "service_previous_boot_state_cleared":
             return "The last boot ended without a clean stop; its saved state was set aside"
         if kind == "service_bus_arm":
@@ -73,6 +77,8 @@ class Summary:
         if stage == "local" and kind == "lsm_local_registered":
             paths = event.get("protected_paths", [])
             return f"Protecting {len(paths)} VM file(s): " + ", ".join(paths)
+        if stage == "local" and kind == "lsm_local_exempted":
+            return "Response stage may destroy protected files (exempt from the file guard)"
         if stage == "lsm" and kind == "lsm_status":
             lines = []
             for target in event.get("targets", []):

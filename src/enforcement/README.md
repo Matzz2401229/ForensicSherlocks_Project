@@ -20,7 +20,8 @@ test mode. Nothing is pinned.
 
 The integrated service uses `local_lsm` with `lsm_local.py` to register absolute VM
 file paths before USB arming and readiness, then verifies them independently of USB
-events. Missing entries or a changed/degraded controller fail the service. A normal
+events. Missing entries or a changed/degraded controller fail the service, except a
+file destroyed by the response stage, which is reported and released. A normal
 service stop detaches the controller and releases the restrictions. No USB event
 releases VM files, and PREPARE_REMOVE is refused by the local-files controller.
 Configuration is in `config/lsm-local.example.json`; see
@@ -28,8 +29,9 @@ Configuration is in `config/lsm-local.example.json`; see
 
 VM-file protection denies new data opens by all processes, including root. It
 does not revoke existing data descriptors, protect replacement inodes automatically,
-or prevent memory dumping. Delete/sanitise targets must be separate: the service
-rejects declared overlaps rather than bypassing the guard. Select either `local_lsm`
+or prevent memory dumping. The service exempts its own response stage (controller
+`EXEMPT` command, by PID and process start time, removed when the process exits), so
+a delete response can destroy protected files. Select either `local_lsm`
 or legacy `lsm`, not both. Neither mode is enabled by the default profile.
 
 Build with `bash src/enforcement/bpf/build.sh` from the repository root. See

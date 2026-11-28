@@ -244,6 +244,11 @@ class FakeHost:
         if self.fail_at == "register_local":
             raise ServiceError("injected local registration failure")
         return event("lsm_local_registered", protection_complete=True)
+    def exempt_responder(self, pid):
+        self.calls.append(("exempt", pid))
+        if self.fail_at == "exempt":
+            raise ServiceError("injected exemption failure")
+        return event("lsm_local_exempted", pid=pid)
     def check_local(self, *, force=False):
         self.calls.append("check_local")
         if self.fail_at == "check_local":
@@ -331,6 +336,26 @@ class SupervisionTests(Fixture):
         self.assertEqual(ready["lsm_scope"], "vm-files")
         self.assertTrue(ready["lsm_enabled"])
         self.assertIn("restore", host.calls)
+
+    def test_response_stage_is_exempted_before_usb_events_can_reach_it(self):
+        supervisor, host, output, _ = self.harness(local_files=True)
+        self.assertEqual(supervisor.run(), 0)
+        exempt = next(call for call in host.calls if isinstance(call, tuple) and call[0] == "exempt")
+        self.assertEqual(exempt[1], supervisor.processes["responses"].pid)
+        self.assertLess(host.calls.index(("spawn", "responses")), host.calls.index(exempt))
+        self.assertLess(host.calls.index(exempt), host.calls.index(("spawn", "enforcement")))
+        self.assertTrue(any(row.get("event", {}).get("type") == "lsm_local_exempted" for row in output))
+
+    def test_failed_exemption_stops_before_readiness(self):
+        supervisor, host, output, _ = self.harness(local_files=True, fail_at="exempt")
+        self.assertEqual(supervisor.run(), 1)
+        self.assertNotIn(("spawn", "monitor"), host.calls)
+        self.assertFalse(any(row["type"] == "service_ready" for row in output))
+
+    def test_no_exemption_without_vm_file_protection(self):
+        supervisor, host, _, _ = self.harness()
+        self.assertEqual(supervisor.run(), 0)
+        self.assertFalse(any(isinstance(call, tuple) and call[0] == "exempt" for call in host.calls))
 
     def test_failed_vm_registration_stops_controller_without_arming_or_ready(self):
         supervisor, host, output, _ = self.harness(local_files=True, fail_at="register_local")
