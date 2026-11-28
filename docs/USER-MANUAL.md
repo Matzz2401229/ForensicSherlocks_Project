@@ -602,6 +602,18 @@ bash src/enforcement/bpf/build.sh
 sudo src/enforcement/bpf/build/lsm_controller --check
 ```
 
+Warnings from the generated `vmlinux.h` kernel header are harmless. Then verify the
+build with the automated tests; the second command loads the guard and tests it on
+disposable files only:
+
+```bash
+python3 -m unittest discover -s tests -p 'test_*.py'
+sudo python3 tests/enforcement/test_bpf_lsm.py --local
+```
+
+Expect `OK` from the unit tests and `All BPF-LSM acceptance checks passed` from the
+guard tests. Rebuild and repeat both after updating the code.
+
 ### Create disposable VM files and a local profile
 
 The following uses the manual's previously prepared `logs/manual-service.json`

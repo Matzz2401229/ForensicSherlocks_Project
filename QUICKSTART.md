@@ -70,7 +70,20 @@ sudo python3 src/monitor/usb_monitor.py --check
 ```
 
 **Expect:** `Built: ...lsm_controller`, then `lsm_preflight_passed`, then a
-`monitor_preflight` record with `"status": "passed"`.
+`monitor_preflight` record with `"status": "passed"`. The build may print a few
+warnings from the generated `vmlinux.h` kernel header; they are harmless.
+
+Then run the automated tests. The second command loads the file guard into the
+kernel and tests it on disposable files only:
+
+```bash
+python3 -m unittest discover -s tests -p 'test_*.py'
+sudo python3 tests/enforcement/test_bpf_lsm.py --local
+```
+
+**Expect:** the unit tests end with `OK`, and the guard tests print a series of
+`PASS:` lines ending with `All BPF-LSM acceptance checks passed`. Do not continue
+if either fails.
 
 ### A4. Identify your USB drive
 
