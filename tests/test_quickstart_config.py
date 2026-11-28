@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "src" / "enforcement"))
 from lsm_local import load_local_config  # noqa: E402
 sys.path.insert(0, str(ROOT / "src" / "policy"))
 from device_policy import load_policy  # noqa: E402
+from usb_authorization import load_config as load_enforcement  # noqa: E402
 
 DRIVE = {"usb_id": "4-1", "sysfs_path": "/sys/bus/usb/devices/4-1", "bus": 4, "device_address": 3,
          "vendor_id": "125f", "product_id": "db8a", "serial": "20A1210010230055",
@@ -52,7 +53,7 @@ class QuickstartConfigTests(unittest.TestCase):
                          [{"name": "trusted-usb", "vendor_id": "125f", "product_id": "db8a",
                            "serial": "20A1210010230055"}])
         self.assertEqual(self.load("quick-block.json")["allowlist"], [])
-        self.assertEqual(self.load("quick-enforcement.json")["managed_buses"], ["usb4"])
+        self.assertEqual(self.load("quick-enforcement.json")["managed_buses"], "auto")
         self.assertEqual(self.load("quick-responses.json")["actions"], [{"type": "lock_session"}])
         service = self.load("quick-service-block.json")
         self.assertEqual(service["policy"], "logs/quick-block.json")
@@ -62,11 +63,18 @@ class QuickstartConfigTests(unittest.TestCase):
         self.assertEqual((demo / "restricted.txt").read_text(), "Protected VM file\n")
         self.assertEqual((demo / "control.txt").read_text(), "Readable control file\n")
 
+    def test_single_bus_option_manages_only_the_drive_bus(self):
+        code, out, _ = self.run_main("--single-bus")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.load("quick-enforcement.json")["managed_buses"], ["usb4"])
+        self.assertIn("Managed USB buses: usb4", out)
+
     def test_generated_files_pass_the_project_validators(self):
         self.run_main()
         load_policy(self.root / "logs" / "quick-allow.json")
         load_policy(self.root / "logs" / "quick-block.json")
         load_local_config(self.root / "logs" / "quick-lsm.json")
+        self.assertEqual(load_enforcement(self.root / "logs" / "quick-enforcement.json").managed_buses, "auto")
 
     def test_extra_protected_files_are_added_once(self):
         secret = self.root / "secret.txt"
@@ -141,7 +149,8 @@ class QuickstartConfigTests(unittest.TestCase):
     def test_summary_shows_drive_and_files(self):
         _, out, _ = self.run_main()
         self.assertIn("ADATA USB Flash Drive", out)
-        self.assertIn("usb4", out)
+        self.assertIn("bus 4", out)
+        self.assertIn("Managed USB buses: all (auto)", out)
         self.assertIn("restricted.txt", out)
 
 if __name__ == "__main__":

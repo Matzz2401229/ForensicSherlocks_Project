@@ -37,7 +37,7 @@ def protected_file(value):
     return str(path.resolve())
 
 
-def documents(device, demo, extra):
+def documents(device, demo, extra, single_bus=False):
     rule = {"name": "trusted-usb", "vendor_id": device["vendor_id"], "product_id": device["product_id"]}
     if device.get("serial"):
         rule["serial"] = device["serial"]
@@ -53,7 +53,9 @@ def documents(device, demo, extra):
     return {
         "quick-allow.json": {"schema_version": 1, "default_action": "block", "allowlist": [rule]},
         "quick-block.json": {"schema_version": 1, "default_action": "block", "allowlist": []},
-        "quick-enforcement.json": {"schema_version": 1, "managed_buses": ["usb" + str(device["bus"])],
+        # "auto" arms every bus, so a device on another port or controller is still blocked.
+        "quick-enforcement.json": {"schema_version": 1,
+                                   "managed_buses": ["usb" + str(device["bus"])] if single_bus else "auto",
                                    "state_file": STATE},
         "quick-responses.json": {"schema_version": 1, "cooldown_seconds": 30,
                                  "actions": [{"type": "lock_session"}]},
@@ -79,7 +81,7 @@ def load_device(path):
     return device
 
 
-def create(root, extra):
+def create(root, extra, single_bus=False):
     """Write the configuration and demo files under root; return the device and documents."""
     state = root / STATE
     if state.exists() or Path(str(state) + ".service-owner.json").exists():
@@ -95,7 +97,7 @@ def create(root, extra):
     (demo / "restricted.txt").write_text("Protected VM file\n")
     (demo / "control.txt").write_text("Readable control file\n")
     (root / "logs").mkdir(exist_ok=True)
-    docs = documents(device, demo, extra)
+    docs = documents(device, demo, extra, single_bus)
     for name, document in docs.items():
         (root / "logs" / name).write_text(json.dumps(document, indent=2) + "\n")
     return device, docs
@@ -105,14 +107,17 @@ def main(argv=None, root=ROOT):
     parser = argparse.ArgumentParser(description="Create the PortWatchman quick-start configuration in logs/ from logs/quick-device.json.")
     parser.add_argument("--protect", action="append", default=[], metavar="FILE",
                         help="Extra VM file to protect while the service runs (repeatable)")
+    parser.add_argument("--single-bus", action="store_true",
+                        help="Manage only the drive's bus instead of every bus (devices on other ports are not blocked)")
     args = parser.parse_args(argv)
     try:
-        device, docs = create(Path(root), args.protect)
+        device, docs = create(Path(root), args.protect, args.single_bus)
     except SetupError as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1
     print(f"Drive:            {describe(device)}")
-    print(f"Managed USB bus:  usb{device['bus']}")
+    buses = docs["quick-enforcement.json"]["managed_buses"]
+    print(f"Managed USB buses: {'all (auto)' if buses == 'auto' else ', '.join(buses)}")
     print("Protected files:")
     for path in docs["quick-lsm.json"]["protected_paths"]:
         print(f"  {path}")

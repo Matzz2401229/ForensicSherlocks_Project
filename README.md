@@ -10,6 +10,9 @@ This guide is for users operating the tool in an Ubuntu virtual machine or
 reviewing its behaviour for a demonstration. PortWatchman is an academic prototype;
 the [limitations](#limitations) describe the boundaries of its protection.
 
+New to PortWatchman? Start with the [quick start](QUICKSTART.md): Part A sets it up
+and configures it, Part B tests each behaviour.
+
 ## Contents
 
 - [How it works](#how-it-works)
