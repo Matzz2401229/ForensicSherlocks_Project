@@ -375,7 +375,8 @@ This shows that once armed, PortWatchman keeps running without a terminal, acros
 logouts and restarts, until the owner disarms it. **Its responses are applied:**
 connect only your approved USB while it is armed.
 
-**Terminal B:** install the real-use profile again and arm it now and at every boot.
+**Terminal B:** switch back to the real-use profile from A7 (B2 and B3 replaced it
+with test profiles), then arm it now and at every boot.
 
 ```bash
 sudo python3 scripts/install_service.py --config logs/quick-service-deploy.json --replace-config
@@ -488,7 +489,8 @@ needs a USB device that is **not** on the allowlist (for example a second flash
 drive); with only your approved USB the result looks the same either way, so skip
 B6 and record it as a limitation.
 
-**Test:** install the real-use profile and arm it at boot:
+**Test:** switch back to the real-use profile from A7 (B5 replaced it), then arm it
+at boot:
 
 ```bash
 sudo python3 scripts/install_service.py --config logs/quick-service-deploy.json --replace-config
