@@ -368,6 +368,14 @@ alongside the supervisor.
 
 ### Install once
 
+The background service is the intended way to run PortWatchman. A foreground
+`run` stops when its terminal is closed: its responses and file protection end,
+while the USB buses stay in default-deny until restored. The service has no
+terminal, keeps running when terminals are closed or the user logs out, and starts
+at boot when enabled. The [quick start](../QUICKSTART.md) (step A7) generates a
+ready profile, `logs/quick-service-deploy.json`, with the owner's USB allowed and
+responses applied.
+
 Stop any foreground run and restore its saved state before installation. If you
 want optional file protection, prepare it using the next relevant section before
 installing the profile.
@@ -402,15 +410,21 @@ Editing `config/` or `logs/` in the clone does not change the installed service.
 | Inspect last exit result | `sudo systemctl show portwatchman -p Result -p ExecMainStatus` |
 | Read recent logs | `sudo journalctl -u portwatchman -n 100 --no-pager -o cat` |
 | Follow live logs | `sudo journalctl -u portwatchman -f -o cat` |
+| Follow live events as readable lines | `sudo python3 /opt/portwatchman/src/daemon/portwatchman.py follow` (add `--recent 50` for earlier events) |
+| Switch the installed profile (stopped only) | `sudo python3 scripts/install_service.py --config PROFILE.json --replace-config` from the checkout |
 | Check boot enablement | `systemctl is-enabled portwatchman` |
 
 The log shows the monitor heartbeat, its policy health echo and the file-protection
 status check only when their content changes (for example a new denied open or a
 failure); unchanged repeats are still checked but not logged. Add `--log-all` to a
-foreground `run` to see every record. For a foreground `run`, `--summary` prints one short
-readable line per important event (USB allowed or blocked, denied file opens,
-responses, problems and shutdown) instead of JSON. The installed service always logs
-JSON.
+foreground `run` to see every record. The installed service logs JSON; `follow`
+prints one short readable line per important event (USB allowed or blocked, denied
+file opens, responses, problems and shutdown), the same as `--summary` does for a
+foreground `run`.
+
+`--replace-config` copies the new profile's configuration over the installed one
+and removes optional files the new profile does not use. It refuses while the
+service is running or while saved arm state exists; restore that state first.
 
 Keep the USB disconnected at startup, wait for healthy readiness, then connect it.
 Normal `systemctl start` waits for pipeline readiness, not just creation of a Python

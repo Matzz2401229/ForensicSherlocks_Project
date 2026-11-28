@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -111,6 +112,42 @@ def run(config, emit, log_all=False):
         lease.close()
 
 
+def follow_lines(stream, out=print):
+    """Print readable lines for the service's journal records (one JSON record per line)."""
+    from service_summary import Summary
+    summary = Summary()
+    for raw in stream:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            record = json.loads(raw)
+        except ValueError:
+            out(raw)  # not a PortWatchman record, e.g. a systemd message
+            continue
+        if isinstance(record, dict):
+            text = summary.line(record)
+            if text is not None:
+                out(text)
+
+
+def follow(recent):
+    """Show the installed service's events as they happen (Ctrl+C to stop watching)."""
+    command = ["journalctl", "-u", "portwatchman", "-f", "-n", str(recent), "-o", "cat"]
+    try:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, text=True)
+    except FileNotFoundError as error:
+        raise ServiceError("journalctl is not available; follow needs the systemd journal") from error
+    try:
+        follow_lines(process.stdout, out=lambda text: print(text, flush=True))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+    return 0
+
+
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
@@ -122,6 +159,9 @@ def parser():
     foreground.add_argument("--log-all", action="store_true", help="Also log unchanged heartbeat and status records")
     foreground.add_argument("--summary", action="store_true", help="Print short readable lines for important events instead of JSON")
     sub.add_parser("status", help="Inspect root-owned runtime status, checking PID and boot identity")
+    watch = sub.add_parser("follow", help="Show the background service's events as short readable lines (Ctrl+C to stop)")
+    watch.add_argument("--recent", type=int, default=0, metavar="N",
+                       help="Also show the last N journal records (default: only new events)")
     sub.add_parser("restore", help="Restore saved bus defaults after a failure, only when the service is stopped")
     return result
 
@@ -134,6 +174,10 @@ def main(argv=None):
             record = status()
             emit(record)
             return 0 if record["running"] and record["healthy"] else 1
+        if args.command == "follow":
+            if not 0 <= args.recent <= 10000:
+                raise ServiceError("--recent must be between 0 and 10000")
+            return follow(args.recent)
         config = load_config(args.config)
         if args.command == "restore":
             return restore(config, emit)

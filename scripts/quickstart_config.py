@@ -86,12 +86,12 @@ def update_selection(root, args):
 def documents(device, demo, selection, single_bus=False):
     """Build every configuration document. device is None when no approved USB is set up."""
 
-    def service(policy, responses="logs/quick-responses.json"):
+    def service(policy, responses="logs/quick-responses.json", apply=False):
         return {"schema_version": 1, "policy": policy,
                 "enforcement": "logs/quick-enforcement.json",
                 "responses": responses,
                 "lsm": None, "local_lsm": "logs/quick-lsm.json",
-                "apply_responses": False}
+                "apply_responses": apply}
 
     paths = list(dict.fromkeys([str(demo / "restricted.txt"), *selection["protect"]]))
     if single_bus and device is None:
@@ -107,6 +107,8 @@ def documents(device, demo, selection, single_bus=False):
         "quick-lsm.json": {"schema_version": 1, "socket_path": "/run/portwatchman/lsm_controller.sock",
                            "protected_paths": paths},
         "quick-service-block.json": service("logs/quick-block.json"),
+        # Test B3: the same blocked USB, with the lock response applied.
+        "quick-service-lock.json": service("logs/quick-block.json", apply=True),
     }
     if device is not None:
         rule = {"name": "trusted-usb", "vendor_id": device["vendor_id"], "product_id": device["product_id"]}
@@ -124,8 +126,15 @@ def documents(device, demo, selection, single_bus=False):
             "actions": [{"type": "lock_session"},
                         {"type": "delete", "paths": selection["destroy"], "passes": 1},
                         {"type": "power", "mode": "poweroff", "method": "graceful"}]}
+        # Test B5: the same USB is unapproved here, and the full plan is applied.
         docs["quick-service-destroy.json"] = service("logs/quick-block.json",
-                                                     "logs/quick-responses-destroy.json")
+                                                     "logs/quick-responses-destroy.json", apply=True)
+    # Profile for the installed background service (step A7): the owner's USB is allowed,
+    # and the response plan is applied, not previewed.
+    docs["quick-service-deploy.json"] = service(
+        "logs/quick-allow.json" if device is not None else "logs/quick-block.json",
+        "logs/quick-responses-destroy.json" if selection["destroy"] else "logs/quick-responses.json",
+        apply=True)
     return docs
 
 
@@ -221,6 +230,8 @@ def main(argv=None, root=ROOT):
     print("  sudo python3 src/daemon/portwatchman.py --config logs/quick-service-block.json check")
     if selection["destroy"]:
         print("  sudo python3 src/daemon/portwatchman.py --config logs/quick-service-destroy.json check")
+    plan = "lock, destroy the files above, power off" if selection["destroy"] else "lock the screen"
+    print(f"Background service profile (step A7): logs/quick-service-deploy.json, responses APPLIED ({plan})")
     return 0
 
 

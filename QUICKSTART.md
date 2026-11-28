@@ -7,8 +7,8 @@ The guide has two parts:
 
 | Part | What you do | When |
 |---|---|---|
-| [A. Setup and configuration](#part-a-setup-and-configuration) | Install, build, identify your USB, generate the configuration | Once per VM, or again after changing the USB or the files to protect |
-| [B. Functionality tests](#part-b-functionality-tests) | Run PortWatchman and check each behaviour | Each dry run, and before recording |
+| [A. Setup and configuration](#part-a-setup-and-configuration) | Install, build, identify your USB, generate the configuration, install the background service | Once per VM, or again after changing the USB or the files to protect |
+| [B. Functionality tests](#part-b-functionality-tests) | Arm the background service with each test profile and check each behaviour | Each dry run, and before recording |
 
 **You need**
 
@@ -174,7 +174,9 @@ The generated files:
 | `logs/quick-service-allow.json` | Service profile using the allowlist with your drive |
 | `logs/quick-service-block.json` | Service profile using the empty allowlist |
 | `logs/quick-responses-destroy.json` | Response plan for B5: lock, destroy, power off (only with `--destroy`) |
-| `logs/quick-service-destroy.json` | Service profile for B5 (only with `--destroy`) |
+| `logs/quick-service-lock.json` | Service profile for B3: empty allowlist, screen lock applied |
+| `logs/quick-service-destroy.json` | Service profile for B5: empty allowlist, lock, destroy and power off applied (only with `--destroy`) |
+| `logs/quick-service-deploy.json` | Profile for the background service (A7): your USB allowed, responses applied |
 
 These files stay as they are until you edit them or run A5 again.
 
@@ -199,62 +201,113 @@ Skip the third command if you did not use `--destroy`.
 One drive is enough for all of these tests. If you used `--no-allowed-device`,
 skip the first `check` command; there is no allow profile.
 
+### A7. Install the background service (not armed yet)
+
+For real use, PortWatchman runs as a background (systemd) service. It has no
+terminal or window, keeps running when a terminal is closed or the user logs out,
+and can start again at every boot. Install it with the profile made for that:
+
+```bash
+sudo python3 scripts/install_service.py --config logs/quick-service-deploy.json
+sudo python3 /opt/portwatchman/src/daemon/portwatchman.py --config /etc/portwatchman/service.json check
+```
+
+**Expect:** a `service_installed` record, then `service_preflight_passed`.
+
+Installing copies the code to `/opt/portwatchman` and the configuration to
+`/etc/portwatchman`; it does **not** start the service. The installed profile allows
+your USB from A4, protects the files from A5 and **applies** the response plan:
+once armed, an unapproved USB locks the screen and, if you used
+`--destroy`, destroys those files and powers off. Later changes to `logs/` do not
+change the installed copy until it is installed again; Part B switches between
+the test profiles with `--replace-config`.
+
 Now unmount the drive (use the eject icon in Files), then disconnect it from the
-VM. **Keep it disconnected until a test says to connect it.**
+VM. **Keep it disconnected until a test says to connect it.** This is a good point
+for a VM snapshot to return to before Part B.
 
 ---
 
 ## Part B. Functionality tests
 
-Each test starts and stops PortWatchman itself. Before each one, check that the USB
-is disconnected and no earlier run is still active (`Ctrl+C` in Terminal A).
+Every test uses the background service installed in A7, the way PortWatchman is
+meant to run. It has no window; watch what it does with `follow`, which prints one
+short line per important event.
 
-| Test | Shows | Profile |
+**Two terminals.** Terminal A shows the events; Terminal B runs the test commands.
+Open both inside `portwatchman`. Start `follow` in Terminal A first: it shows only
+events from that moment on.
+
+```bash
+sudo python3 /opt/portwatchman/src/daemon/portwatchman.py follow
+```
+
+| To | Run in Terminal B |
+|---|---|
+| Arm now | `sudo systemctl start portwatchman` |
+| Arm now and at every boot | `sudo systemctl enable --now portwatchman` |
+| Disarm | `sudo systemctl disable --now portwatchman` |
+| Check the state | `sudo python3 /opt/portwatchman/src/daemon/portwatchman.py status` |
+| Switch the installed profile (disarmed only) | `sudo python3 scripts/install_service.py --config logs/PROFILE --replace-config` |
+
+| Test | Shows | Installed profile |
 |---|---|---|
-| [B1](#b1-approved-usb-and-file-protection) | An approved USB is allowed; protected VM files are denied | allow |
-| [B2](#b2-unapproved-usb-preview) | An unapproved USB is blocked; the response is previewed only | block |
-| [B3](#b3-real-screen-lock-response) | The screen-lock response runs for real | block |
-| [B4](#b4-keep-protection-on-across-reboots) | The background service survives closing the terminal and restarting | block |
-| [B5](#b5-full-response-lock-destroy-and-power-off) | An unapproved USB locks the screen, destroys the chosen files (even protected ones) and powers off | destroy |
-| [B6](#b6-usb-connected-during-boot-known-limitation) | A USB connected while the VM starts is not re-checked (known limitation) | installed block |
+| [B1](#b1-approved-usb-and-file-protection) | An approved USB is allowed; protected VM files are denied | `quick-service-deploy.json` (from A7) |
+| [B2](#b2-unapproved-usb-preview) | An unapproved USB is blocked; the response is previewed only | `quick-service-block.json` |
+| [B3](#b3-real-screen-lock-response) | The screen-lock response runs for real | `quick-service-lock.json` |
+| [B4](#b4-the-service-persists) | The armed service keeps running after closing the terminal, logging out and restarting | `quick-service-deploy.json` |
+| [B5](#b5-full-response-lock-destroy-and-power-off) | An unapproved USB locks the screen, destroys the chosen files (even protected ones) and powers off | `quick-service-destroy.json` |
+| [B6](#b6-usb-connected-during-boot-known-limitation) | A USB connected while the VM starts is not re-checked (known limitation) | `quick-service-deploy.json` |
+
+Before each test, check that the USB is disconnected and the service is disarmed.
 
 The file guard (step 6) and the responses (step 7) work in sequence. While
 PortWatchman runs, the guard keeps the protected files closed to everyone. When an
 unapproved USB is connected, the response stage, the one process the guard lets
 through, can destroy them.
 
+A terminal run (`sudo python3 src/daemon/portwatchman.py --config logs/PROFILE run --summary`)
+is also available for troubleshooting. It stops when its terminal is closed, so do
+not use it for real protection.
+
 ### B1. Approved USB and file protection
 
-**Terminal A:** start PortWatchman and wait for the `Ready.` line.
+The profile from A7 is already installed. **Its responses are applied:** connect
+only your approved USB while it is armed.
+
+**Terminal A:** start `follow`. **Terminal B:** arm the service.
 
 ```bash
-sudo python3 src/daemon/portwatchman.py --config logs/quick-service-allow.json run --summary
+sudo systemctl start portwatchman
 ```
 
-`--summary` prints one short line per important event. Leave it off to see the full
-JSON records instead.
+**Expect** in Terminal A: `Protecting 3 VM file(s): ...`, `Armed usb1, ...`,
+`Response stage may destroy protected files (exempt from the file guard)`, then
+`Ready. Response plan: ... (APPLIED)`.
 
-**Terminal B** (also inside `portwatchman`): read the demo files with no USB connected.
+**Terminal B:** read the demo files with no USB connected.
 
 ```bash
 cat build/test-tmp/quickstart/restricted.txt
 cat build/test-tmp/quickstart/control.txt
 sudo cat build/test-tmp/quickstart/restricted.txt
+cat ~/Desktop/evidence/notes.txt
 sudo python3 src/enforcement/lsm_client.py STATUS
 ```
 
-**Expect:** both `restricted.txt` reads show `Permission denied` and `control.txt`
-opens. About a second later, Terminal A shows `Blocked ... attempts to open
-.../restricted.txt`, and `denied_opens` in the STATUS output is above 0.
+Use one of your own protected files in the fourth command. **Expect:** every
+protected file shows `Permission denied` and `control.txt` opens. About a second
+later, Terminal A shows `Blocked ... attempts to open ...`, and the STATUS output
+lists your protected files with `denied_opens` above 0.
 
-Try to delete it too:
+Try to delete one too:
 
 ```bash
 sudo rm build/test-tmp/quickstart/restricted.txt
 ```
 
 **Expect:** `Permission denied`, and Terminal A shows `Blocked 1 attempt to delete or
-change .../restricted.txt`. The service keeps running.
+change .../restricted.txt`.
 
 Now connect the USB to the VM.
 
@@ -264,29 +317,29 @@ cat build/test-tmp/quickstart/restricted.txt
 ```
 
 **Expect:** Terminal A shows your drive as `ALLOWED by rule "trusted-usb"`, the drive
-appears in `lsblk`, and the restricted file is still denied.
+appears in `lsblk`, and the protected file is still denied.
 
-Unmount and disconnect the drive, then press **Ctrl+C** in Terminal A.
-**Expect:** `Restored USB defaults: usb1=1, usb2=1, ...` (one entry per bus; your
-buses may differ) and `Stopped cleanly`.
-
-Read the restricted file once more:
+Unmount and disconnect the drive, then disarm:
 
 ```bash
+sudo systemctl stop portwatchman
 cat build/test-tmp/quickstart/restricted.txt
 ```
 
-**Expect:** it now opens. This is the "without protection" comparison.
+**Expect:** Terminal A shows `VM file protection released`, `Restored USB defaults:
+usb1=1, usb2=1, ...` and `Stopped cleanly`, and the file now opens. This is the
+"without protection" comparison.
 
 ### B2. Unapproved USB (preview)
 
-**Terminal A:**
+**Terminal B:** install the preview profile and arm.
 
 ```bash
-sudo python3 src/daemon/portwatchman.py --config logs/quick-service-block.json run --summary
+sudo python3 scripts/install_service.py --config logs/quick-service-block.json --replace-config
+sudo systemctl start portwatchman
 ```
 
-Wait for `Ready.`, then connect the USB. In Terminal B:
+Wait for `Ready.` in Terminal A (it says `preview only`), then connect the USB.
 
 ```bash
 lsblk -o NAME,TRAN,SIZE,FSTYPE,MOUNTPOINTS
@@ -298,14 +351,15 @@ lsblk -o NAME,TRAN,SIZE,FSTYPE,MOUNTPOINTS
 - Terminal A shows `Response lock_session: preview only, not applied` (the screen does **not** lock)
 - The drive's storage does not appear in `lsblk`
 
-Disconnect the drive and press **Ctrl+C** in Terminal A.
+Disconnect the drive and disarm (`sudo systemctl stop portwatchman`).
 
 ### B3. Real screen-lock response
 
-Same test, with the response applied:
+**Terminal B:**
 
 ```bash
-sudo python3 src/daemon/portwatchman.py --config logs/quick-service-block.json run --apply-responses --summary
+sudo python3 scripts/install_service.py --config logs/quick-service-lock.json --replace-config
+sudo systemctl start portwatchman
 ```
 
 Wait for `Ready.` (it now says `APPLIED`), then connect the USB.
@@ -313,30 +367,36 @@ Wait for `Ready.` (it now says `APPLIED`), then connect the USB.
 **Expect:** the Ubuntu screen locks. Unlock it, and Terminal A shows
 `Response lock_session: done`.
 
-Disconnect the drive and press **Ctrl+C**.
+Disconnect the drive and disarm (`sudo systemctl stop portwatchman`).
 
-### B4. Keep protection on across reboots
+### B4. The service persists
 
-A `run` in a terminal ends when the terminal closes or the VM restarts. To keep
-PortWatchman armed until you turn it off, install it as a background service.
+This shows that once armed, PortWatchman keeps running without a terminal, across
+logouts and restarts, until the owner disarms it. **Its responses are applied:**
+connect only your approved USB while it is armed.
 
-**Set up** (configuration step, done once per profile):
+**Terminal B:** install the real-use profile again and arm it now and at every boot.
 
 ```bash
-sudo python3 scripts/install_service.py --config logs/quick-service-block.json
+sudo python3 scripts/install_service.py --config logs/quick-service-deploy.json --replace-config
 sudo systemctl enable --now portwatchman
 sudo python3 /opt/portwatchman/src/daemon/portwatchman.py status
+cat build/test-tmp/quickstart/restricted.txt
 ```
 
-**Expect:** `"running": true` and `"healthy": true`. The installed copy uses its own
-settings in `/etc/portwatchman`, with responses in preview. Those settings stay
-until you edit them there or reinstall; editing files in `logs/` does not change
-the installed service.
+**Expect:** `"running": true` and `"healthy": true`, and the protected file shows
+`Permission denied`.
 
-**Test:** close the terminal, open a new one in `portwatchman`, and check the status
-again. It is still running. Then disconnect the USB and restart the VM
-(`sudo reboot`, or **VM > Power > Reset** to test a forced restart). After logging
-in, open a terminal in `portwatchman`:
+**Close the terminals.** Close both terminals, open a new one in `portwatchman`, and
+run the `status` and `cat` commands again. **Expect:** still running and healthy,
+and the file is still denied.
+
+**Log out.** Log out of the Ubuntu desktop, log back in, open a terminal in
+`portwatchman` and repeat the two commands. **Expect:** the same.
+
+**Restart.** With the USB disconnected, restart the VM (`sudo reboot`, or
+**VM > Power > Reset** to test a forced restart). After logging in, open a terminal
+in `portwatchman`:
 
 ```bash
 sudo python3 /opt/portwatchman/src/daemon/portwatchman.py status
@@ -344,31 +404,31 @@ cat build/test-tmp/quickstart/restricted.txt
 sudo journalctl -b -u portwatchman --no-pager -o cat | grep -E 'previous_boot|service_ready'
 ```
 
-**Expect:** still healthy, the restricted file is denied, and `service_ready` for
-this boot. After a forced restart you also see `service_previous_boot_state_cleared`.
-Connect the USB: it is blocked.
+**Expect:** still healthy, the protected file is denied, and `service_ready` for this
+boot. After a forced restart you also see `service_previous_boot_state_cleared`.
+Connect your approved USB: it is allowed. Unmount and disconnect it again.
 
-Keep the USB disconnected while the VM starts. A device that is already connected
-when the service becomes ready keeps its access.
+Keep any USB disconnected while the VM starts. A device that is already connected
+when the service becomes ready keeps its access (see B6).
 
-Protection stays on through every restart until you turn it off:
+**Disarm:**
 
 ```bash
 sudo systemctl disable --now portwatchman
 cat build/test-tmp/quickstart/restricted.txt
 ```
 
-**Expect:** the file opens again. `systemctl stop` without `disable` turns it off
-only until the next boot.
+**Expect:** the file opens again. To open protected files as the owner, disarm,
+use them, then arm again with `enable --now`. `sudo systemctl stop portwatchman`
+disarms only until the next boot.
 
 ### B5. Full response: lock, destroy and power off
 
-This test destroys files and powers off the VM. **Take a VM snapshot first**, and run
-B4's `disable --now` command if the background service is still running.
+This test destroys files and powers off the VM. **Take a VM snapshot first.**
 
 It uses the files you added with `--destroy` in A5 (in the example, the two evidence
 files, which are also protected). If you did not add any, run A5 again with
-`--destroy`, then the third A6 command.
+`--destroy`.
 
 **Preview first.** List what would be destroyed (nothing is deleted):
 
@@ -380,53 +440,43 @@ python3 src/responses/responses.py --config logs/quick-responses-destroy.json ru
 **Expect:** `validate` lists `lock_session`, `delete` and `power`, and `would_delete`
 lists only your chosen files.
 
-Terminal A:
+**Terminal B:** install the destroy profile and arm (now only, not at boot).
 
 ```bash
-sudo python3 src/daemon/portwatchman.py --config logs/quick-service-destroy.json run --summary
+sudo python3 scripts/install_service.py --config logs/quick-service-destroy.json --replace-config
+sudo systemctl start portwatchman
 ```
 
-Wait for `Ready.`. Terminal A also shows `Response stage may destroy protected files
-(exempt from the file guard)`. In Terminal B, try to read a protected file you chose,
-for example:
+Wait for `Ready.` in Terminal A (it says `APPLIED`). Check that a protected file you
+chose is still denied, for example `sudo cat ~/Desktop/evidence/notes.txt`, then
+connect the USB.
 
-```bash
-sudo cat ~/Desktop/evidence/notes.txt
-```
-
-**Expect:** `Permission denied`. Connect the USB and check that Terminal A shows all
-three responses as `preview only, not applied`, and that your files still exist.
-Disconnect the drive and press **Ctrl+C**.
-
-**Applied.** Terminal A, saving the output so it survives the power-off:
-
-```bash
-sudo python3 src/daemon/portwatchman.py --config logs/quick-service-destroy.json run --apply-responses --summary | tee logs/b5-run.log
-```
-
-Wait for `Ready.` (it says `APPLIED`). Check once more that the protected file is
-denied in Terminal B, then connect the USB.
-
-**Expect:** the screen locks, then the VM shuts down by itself. A graceful shutdown
-can take a while if Ubuntu is installing updates.
+**Expect:** Terminal A shows the block and the responses, the screen locks, then the
+VM shuts down by itself. A graceful shutdown can take a while if Ubuntu is
+installing updates.
 
 Start the VM, log in, and open a terminal in `portwatchman`:
 
 ```bash
 ls -la ~/Desktop/evidence
 cat build/test-tmp/quickstart/restricted.txt
-grep -E 'BLOCKED|Response|destroyed' logs/b5-run.log
+sudo journalctl -b -1 -u portwatchman --no-pager -o cat | grep -E '"enforcement_result"|"response_action"|protected_file_destroyed'
 ```
 
 **Expect:** the destroyed files are gone. `restricted.txt`, which is protected but not
-on the destroy list, still exists and opens (PortWatchman is not running now). The
-log shows the block, `Response delete: done` and `Response power: issuing now`; it may
-also show `Protected file destroyed` lines if they were written before the shutdown.
+on the destroy list, still exists and opens (the service was not set to start at
+boot). The journal from the previous boot shows the `block` result, a `delete`
+response with `"ok":true` and the `power` response; it may also show
+`service_protected_file_destroyed` records if they were written before the shutdown.
 
-The next `run` sets aside the arm state left by the power-off automatically, and
-reports each destroyed file as `Protected file not found, skipped`. Run A5 with
-`--undestroy` and `--unprotect` for them, or revert to your snapshot, before testing
-again.
+Before arming again, clear the state left by the power-off:
+
+```bash
+sudo python3 /opt/portwatchman/src/daemon/portwatchman.py --config /etc/portwatchman/service.json restore
+```
+
+The next start reports each destroyed file as `Protected file not found, skipped`.
+Revert to your snapshot to restore the files before testing again.
 
 Deletion overwrites and removes the files. It does not guarantee that no copy is
 left in snapshots, the VM's disk file on the host, or the filesystem journal.
@@ -434,12 +484,20 @@ left in snapshots, the VM's disk file on the host, or the filesystem journal.
 ### B6. USB connected during boot (known limitation)
 
 This checks what happens when a device is connected before PortWatchman starts. It
-uses the background service from B4, so install and enable it again first if you
-turned it off.
+needs a USB device that is **not** on the allowlist (for example a second flash
+drive); with only your approved USB the result looks the same either way, so skip
+B6 and record it as a limitation.
 
-**Test:** shut down the VM. Power it on and, while the boot screen is still showing
-(press **Esc** to stay at the GRUB menu if it appears), connect the USB to the VM.
-Let it finish booting, log in, and open a terminal in `portwatchman`:
+**Test:** install the real-use profile and arm it at boot:
+
+```bash
+sudo python3 scripts/install_service.py --config logs/quick-service-deploy.json --replace-config
+sudo systemctl enable --now portwatchman
+```
+
+Shut down the VM. Power it on and, while the boot screen is still showing (press
+**Esc** to stay at the GRUB menu if it appears), connect the unapproved USB to the
+VM. Let it finish booting, log in, and open a terminal in `portwatchman`:
 
 ```bash
 sudo python3 /opt/portwatchman/src/daemon/portwatchman.py status
@@ -447,12 +505,12 @@ sudo journalctl -b -u portwatchman --no-pager -o cat | grep service_startup_inve
 lsblk -o NAME,TRAN,SIZE,FSTYPE,MOUNTPOINTS
 ```
 
-**Expect (limitation):** the service is healthy, the inventory line lists your drive
-as already connected, and the drive's storage appears in `lsblk`. A device that is
-present before the service becomes ready keeps its access and does not trigger a
-response. Disconnect and reconnect it: it is now blocked.
+**Expect (limitation):** the service is healthy, the inventory line lists the device
+as already connected, and its storage appears in `lsblk`. A device that is present
+before the service becomes ready keeps its access and does not trigger a response.
 
-Turn the service off afterwards with B4's `disable --now` command.
+**Disarm before disconnecting it** (`sudo systemctl disable --now portwatchman`).
+Reconnecting it while armed would trigger the applied response.
 
 ---
 
@@ -462,13 +520,21 @@ Turn the service off afterwards with B4's `disable --now` command.
 |---|---|
 | `bpftool` reports missing tools | Install `linux-tools-$(uname -r)`; see the [user manual](docs/USER-MANUAL.md#requirements-and-installation) |
 | `Existing arm state found` or the service failed | Run the restore command below (state from before a restart is set aside automatically) |
-| `install_service.py` says already installed | Stop it with `sudo systemctl disable --now portwatchman`; see the [update procedure](docs/USER-MANUAL.md#update-the-installed-tool) |
+| `install_service.py` says already installed, or you changed A5 and want the service to use it | Disarm (`sudo systemctl disable --now portwatchman`), then install the profile again with `--replace-config`. For code updates only, see the [update procedure](docs/USER-MANUAL.md#update-the-installed-tool) |
+| `install_service.py` says saved service arm state exists | Run the background-service restore command below, then try again |
+| `follow` shows nothing | It shows only new events: start it before arming, or add `--recent 50` |
 | `check` reports a missing VM file | Run the A5 command again |
 | No block or allow record when connecting | If you used `--single-bus`, the drive may be on another bus: stop, restore, and repeat A4 and A5 |
 | The VM mouse or keyboard stops working | A virtual device reconnected and was blocked: use the VMware console to stop PortWatchman and restore |
-| Screen does not lock | Wait 30 seconds (cooldown) and reconnect; confirm you used `--apply-responses` |
+| Screen does not lock | Wait 30 seconds (cooldown) and reconnect; check that the `Ready.` line says `APPLIED` (B3 profile installed) |
 
-Restore after a failure (stop the service first):
+Restore after a failure or a power-off response (disarm the service first):
+
+```bash
+sudo python3 /opt/portwatchman/src/daemon/portwatchman.py --config /etc/portwatchman/service.json restore
+```
+
+After a failed terminal run, use the checkout instead:
 
 ```bash
 sudo python3 src/daemon/portwatchman.py --config logs/quick-service-block.json restore

@@ -526,12 +526,59 @@ class InterfaceTests(Fixture):
         self.assertNotIn("ExecStart=/bin/sh", text)
 
 
+class FollowTests(unittest.TestCase):
+    def test_follow_prints_readable_lines_for_service_records(self):
+        printed = []
+        lines = [json.dumps({"schema_version": 1, "type": "service_ready", "apply_responses": True}),
+                 "Stopping portwatchman.service - PortWatchman USB policy and response service...",
+                 json.dumps({"schema_version": 1, "type": "service_stage_event", "stage": "monitor",
+                             "event": {"type": "monitor_heartbeat"}}),
+                 ""]
+        portwatchman.follow_lines(lines, out=printed.append)
+        self.assertEqual(len(printed), 2)
+        self.assertIn("Ready.", printed[0])
+        self.assertIn("APPLIED", printed[0])
+        self.assertTrue(printed[1].startswith("Stopping portwatchman.service"))
+
+    def test_follow_rejects_an_out_of_range_history(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(portwatchman.main(["follow", "--recent", "-1"]), 1)
+        self.assertIn("--recent", out.getvalue())
+
+
 class InstallationTests(Fixture):
     def module(self):
         spec = importlib.util.spec_from_file_location("pw_install_service", ROOT / "scripts/install_service.py")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module
+
+    def test_replacing_a_profile_drops_optional_configs_it_no_longer_uses(self):
+        module = self.module()
+        self.assertEqual(module.stale_configs({"service.json": b"", "lsm-local.json": b""}), ["lsm.json"])
+        self.assertEqual(module.stale_configs({"service.json": b""}), ["lsm.json", "lsm-local.json"])
+
+    def test_update_code_and_replace_config_cannot_be_combined(self):
+        module = self.module()
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            module.main(["--update-code", "--replace-config"])
+
+    def test_replace_config_refuses_a_running_service(self):
+        module = self.module()
+        with mock.patch.object(module, "require_linux_root"), mock.patch.object(module, "Lease"), \
+                mock.patch.object(module, "UNIT", self.directory / "missing.service"), \
+                mock.patch.object(module, "directory"), mock.patch.object(module, "CODE", self.directory / "code"), \
+                mock.patch.object(module, "ETC", self.directory / "etc"), \
+                mock.patch.object(module, "DATA", self.directory / "data"), \
+                mock.patch.object(module, "service_active", return_value=True):
+            (self.directory / "code").mkdir()
+            (self.directory / "etc").mkdir()
+            for path in (self.directory / "code", self.directory / "etc"):
+                (path / module.MARKER).write_text('{"managed_by": "portwatchman"}')
+            (self.directory / "etc" / "service.json").write_text("{}")
+            with mock.patch.object(module, "safe_file"), self.assertRaisesRegex(Exception, "Stop the service first"):
+                module.install(self.directory / "profile.json", replace=True)
 
     def test_installed_config_uses_private_state_and_preserves_policy(self):
         module = self.module()

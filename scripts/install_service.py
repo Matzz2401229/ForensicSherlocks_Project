@@ -30,6 +30,18 @@ FILES = (
     "src/responses/responses.py", "src/responses/response_delete.py",
 )
 CONTROLLER = "src/enforcement/bpf/build/lsm_controller"
+OPTIONAL_CONFIGS = ("lsm.json", "lsm-local.json")
+
+
+def service_active():
+    """True while the installed service is running (or starting/stopping)."""
+    return subprocess.run(["/usr/bin/systemctl", "is-active", "--quiet", "portwatchman"],
+                          timeout=30).returncode == 0
+
+
+def stale_configs(configs):
+    """Optional installed config files the new profile no longer uses."""
+    return [name for name in OPTIONAL_CONFIGS if name not in configs]
 
 
 def directory(path, mode):
@@ -91,7 +103,7 @@ def payloads(config):
     return result
 
 
-def install(config_path, update=False):
+def install(config_path, update=False, replace=False):
     require_linux_root()
     lease = Lease()
     lease.acquire()
@@ -120,16 +132,20 @@ def install(config_path, update=False):
             components(config)
             configs = {}
         else:
-            if (ETC / "service.json").exists():
-                raise ServiceError("Already installed. Use --update-code to preserve installed configuration")
+            if (ETC / "service.json").exists() and not replace:
+                raise ServiceError("Already installed. Use --update-code to keep the installed configuration, "
+                                   "or --replace-config to switch to another profile")
+            if replace and service_active():
+                raise ServiceError("Stop the service first: sudo systemctl stop portwatchman")
             if (DATA / "enforcement-state.json").exists():
                 raise ServiceError("Saved service arm state exists; restore it before installation")
             config = load_config(config_path)
             configs = payloads(config)
-            for name, data in configs.items():
-                target = ETC / name
-                if target.exists() and target.read_bytes() != data:
-                    raise ServiceError(f"Conflicting partial configuration; inspect before retrying: {target}")
+            if not replace:
+                for name, data in configs.items():
+                    target = ETC / name
+                    if target.exists() and target.read_bytes() != data:
+                        raise ServiceError(f"Conflicting partial configuration; inspect before retrying: {target}")
         files = list(FILES)
         binary = ROOT / CONTROLLER
         if binary.exists():
@@ -147,10 +163,17 @@ def install(config_path, update=False):
         # Commit the service config last; a partially copied profile is not launchable.
         for name in sorted(configs, key=lambda name: name == "service.json"):
             write_file(ETC / name, configs[name], 0o600)
+        if replace:
+            for name in stale_configs(configs):
+                stale = ETC / name
+                if os.path.lexists(stale):
+                    safe_file(stale)
+                    stale.unlink()
         write_file(CODE / MARKER, encoded({"schema_version": 1, "managed_by": "portwatchman", "files": hashes}), 0o600)
         write_file(UNIT, (ROOT / "systemd/portwatchman.service").read_bytes(), 0o644)
         subprocess.run(["/usr/bin/systemctl", "daemon-reload"], check=True, timeout=30)
         print(json.dumps({"schema_version": 1, "type": "service_installed", "update_code": update,
+                          "replaced_config": replace, "profile": None if update else str(config_path),
                           "code_directory": str(CODE), "config_directory": str(ETC),
                           "start_requested": False, "enable_requested": False,
                           "message": "Installation does not change existing enablement; no start/enable command was issued"}))
@@ -162,10 +185,13 @@ def install(config_path, update=False):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    parser.add_argument("--update-code", action="store_true", help="Update managed code/unit only; preserve installed configs and arm state")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--update-code", action="store_true", help="Update managed code/unit only; preserve installed configs and arm state")
+    mode.add_argument("--replace-config", action="store_true",
+                      help="Switch an existing installation to the --config profile (the service must be stopped)")
     args = parser.parse_args(argv)
     try:
-        return install(args.config, args.update_code)
+        return install(args.config, args.update_code, args.replace_config)
     except Exception as error:
         print(json.dumps({"schema_version": 1, "type": "service_install_error", "message": str(error)}))
         return 1

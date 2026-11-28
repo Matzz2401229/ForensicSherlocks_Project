@@ -193,6 +193,31 @@ class QuickstartConfigTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("--single-bus needs the drive", err)
 
+    def test_deploy_profile_allows_the_owner_usb_and_applies_responses(self):
+        evidence = self.make("evidence.txt")
+        code, out, _ = self.run_main("--protect", str(evidence), "--destroy", str(evidence))
+        self.assertEqual(code, 0)
+        deploy = self.load("quick-service-deploy.json")
+        self.assertEqual(deploy["policy"], "logs/quick-allow.json")
+        self.assertEqual(deploy["responses"], "logs/quick-responses-destroy.json")
+        self.assertIs(deploy["apply_responses"], True)
+        self.assertEqual(deploy["local_lsm"], "logs/quick-lsm.json")
+        self.assertIn("responses APPLIED (lock, destroy the files above, power off)", out)
+        # Preview profiles stay in preview; the B3 and B5 profiles apply their responses.
+        for name, applied in (("quick-service-allow.json", False), ("quick-service-block.json", False),
+                              ("quick-service-lock.json", True), ("quick-service-destroy.json", True)):
+            self.assertIs(self.load(name)["apply_responses"], applied, name)
+        lock = self.load("quick-service-lock.json")
+        self.assertEqual((lock["policy"], lock["responses"]), ("logs/quick-block.json", "logs/quick-responses.json"))
+
+    def test_deploy_profile_without_destroy_list_only_locks(self):
+        self.run_main()
+        self.assertEqual(self.load("quick-service-deploy.json")["responses"], "logs/quick-responses.json")
+
+    def test_deploy_profile_without_allowed_device_blocks_every_usb(self):
+        self.run_main("--no-allowed-device")
+        self.assertEqual(self.load("quick-service-deploy.json")["policy"], "logs/quick-block.json")
+
     def test_symlinked_folder_is_stored_as_real_path(self):
         real = self.root / "real"
         real.mkdir()
